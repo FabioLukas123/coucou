@@ -341,8 +341,13 @@ export class Island {
 
   // ── File drop ───────────────────────────────────────────────────────────────
 
-  private onDragDrop(e: { type: string; paths?: string[] }) {
+  private onDragDrop(e: { type: string; paths?: string[]; position?: { x: number; y: number } }) {
     if (e.type !== "over") void Bridge.log(`drag ${e.type} ${e.paths?.length ?? 0} file(s)`);
+    // No mouse events during a drag: on Linux the drag itself says where it is.
+    if (this.domCursor && e.position && (e.type === "enter" || e.type === "over")) {
+      const dpr = window.devicePixelRatio || 1;
+      this.onCursor(e.position.x / dpr, e.position.y / dpr);
+    }
     if (State.paused) return;
     switch (e.type) {
       case "enter":
@@ -553,8 +558,23 @@ export class Island {
 
     // Outside Tauri (plain browser) drive the cursor from DOM events so the
     // island can be inspected with `npm run dev`.
-    if (!IS_TAURI) {
-      window.addEventListener("mousemove", (e) => this.onCursor(e.clientX, e.clientY));
+    if (!IS_TAURI) this.useDomCursor();
+  }
+
+  private domCursor = false;
+
+  /**
+   * Drive the island from the webview's own mouse events. Used in a plain
+   * browser, and on Linux wherever no global cursor can be read (Wayland):
+   * the window only takes the mouse over the island shape, so leaving the
+   * page is leaving the island.
+   */
+  useDomCursor() {
+    if (this.domCursor) return;
+    this.domCursor = true;
+    window.addEventListener("mousemove", (e) => this.onCursor(e.clientX, e.clientY));
+    if (IS_TAURI) {
+      document.documentElement.addEventListener("mouseleave", () => this.onCursor(-1e4, -1e4));
     }
   }
 

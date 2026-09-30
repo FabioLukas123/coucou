@@ -26,6 +26,13 @@ export interface BootInfo {
   screen: { x: number; y: number; width: number; height: number; scale: number };
   version: string;
   hookPath: string;
+  /** Only for wording: where keys are kept, what the relay is called. */
+  platform: "windows" | "linux";
+  /**
+   * No global cursor to read (most Wayland compositors): the island follows
+   * the webview's own mouse events instead of the `cursor` event.
+   */
+  domCursor: boolean;
 }
 
 export const Bridge = {
@@ -146,6 +153,8 @@ export type BridgeEvent =
 export interface DragDropPayload {
   type: "enter" | "over" | "drop" | "leave";
   paths?: string[];
+  /** Physical pixels, relative to the webview. Windows leaves it at 0,0. */
+  position?: { x: number; y: number };
 }
 
 /** Files dragged onto the island. Only reaches us when the window takes the mouse. */

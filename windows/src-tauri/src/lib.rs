@@ -1,17 +1,22 @@
-// Coucou for Windows — app wiring and the commands the island calls.
+// Coucou for Windows and Linux — app wiring and the commands the island calls.
 
 mod claude;
+mod clock;
 mod files;
 mod hooks;
 mod integrations;
 mod island;
+#[cfg(target_os = "linux")]
+mod linux;
 mod log;
 mod pipe;
 mod secrets;
 mod settings;
 mod tray;
+#[cfg(windows)]
 mod win_user;
 
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -29,7 +34,22 @@ use pipe::Pending;
 use settings::Settings;
 
 /// Keeps spawned helpers from flashing a console window.
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Linux has no console to hide; this keeps the call sites identical.
+#[cfg(not(windows))]
+trait CommandExt {
+    fn creation_flags(&mut self, _flags: u32) -> &mut Self;
+}
+#[cfg(not(windows))]
+impl CommandExt for Command {
+    fn creation_flags(&mut self, _flags: u32) -> &mut Self {
+        self
+    }
+}
+#[cfg(not(windows))]
+const CREATE_NO_WINDOW: u32 = 0;
 
 pub struct Shared {
     pub settings: Mutex<Settings>,
@@ -43,6 +63,11 @@ pub struct BootInfo {
     screen: ScreenInfo,
     version: String,
     hook_path: String,
+    /// "windows" or "linux" — only for wording (where keys are kept, and so on).
+    platform: &'static str,
+    /// No global cursor to read (most Wayland compositors): the island follows
+    /// the webview's own mouse events instead of the `cursor` event.
+    dom_cursor: bool,
 }
 
 #[tauri::command]
@@ -56,6 +81,11 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
         screen,
         version: env!("CARGO_PKG_VERSION").to_string(),
         hook_path: settings::hook_exe_path().to_string_lossy().to_string(),
+        platform: if cfg!(windows) { "windows" } else { "linux" },
+        #[cfg(target_os = "linux")]
+        dom_cursor: linux::dom_cursor(),
+        #[cfg(not(target_os = "linux"))]
+        dom_cursor: false,
     }
 }
 
@@ -94,15 +124,28 @@ fn set_collapsed(app: AppHandle, shared: State<Shared>, collapsed: bool) {
     shared.gate.collapsed.store(collapsed, Ordering::Relaxed);
     island::apply_geometry(&app, &pref, collapsed);
     // The wake strip must always take the mouse, and a resize invalidates the flag.
+    #[cfg(windows)]
     island::set_ignore_cursor(&app, false);
+    #[cfg(target_os = "linux")]
+    island::apply_input_region(&app, &shared.gate);
     shared.gate.forget_ignore_state();
     shared.gate.set_active(!collapsed);
 }
 
 /// The front end pushes the island shape; Rust decides click-through from it.
 #[tauri::command]
-fn set_island_rect(shared: State<Shared>, x: f64, y: f64, width: f64, height: f64) {
+fn set_island_rect(
+    #[allow(unused_variables)] app: AppHandle,
+    shared: State<Shared>,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) {
     shared.gate.set_rect(island::IslandRect { x, y, w: width, h: height });
+    // Linux has no cursor-driven click-through; the input region follows the shape.
+    #[cfg(target_os = "linux")]
+    island::apply_input_region(&app, &shared.gate);
 }
 
 #[tauri::command]
@@ -126,14 +169,17 @@ fn open_url(url: String) {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return;
     }
+    #[cfg(windows)]
     let _ = Command::new("rundll32.exe")
         .args(["url.dll,FileProtocolHandler", &url])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
+    #[cfg(not(windows))]
+    let _ = Command::new("xdg-open").arg(&url).spawn();
 }
 
 /// "Open terminal" opens the working folder in VS Code when `code` is on PATH,
-/// and falls back to Explorer otherwise.
+/// and falls back to Explorer (Linux: the default file manager) otherwise.
 #[tauri::command]
 fn open_in_vscode(path: Option<String>) -> bool {
     // No `cmd /C` anywhere near this. The path is a project folder chosen by
@@ -150,7 +196,10 @@ fn open_in_vscode(path: Option<String>) -> bool {
         }
     }
     if let Some(p) = path.as_deref().filter(|p| !p.is_empty()) {
+        #[cfg(windows)]
         let _ = Command::new("explorer").arg(p).spawn();
+        #[cfg(not(windows))]
+        let _ = Command::new("xdg-open").arg(p).spawn();
     }
     false
 }
@@ -158,6 +207,7 @@ fn open_in_vscode(path: Option<String>) -> bool {
 /// Our own `where`: walks %PATH% against %PATHEXT%, no shell involved.
 /// Rust quotes arguments correctly for `.cmd`/`.bat` targets since 1.77, so
 /// spawning `code.cmd` directly is safe.
+#[cfg(windows)]
 fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
     let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
     let dirs = std::env::var_os("PATH")?;
@@ -165,6 +215,29 @@ fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
         for ext in exts.split(';').filter(|e| !e.is_empty()) {
             let candidate = dir.join(format!("{stem}{}", ext.to_lowercase()));
             if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Our own `which`: the first executable file called `stem` on $PATH. The
+/// Arch packages name VS Code `code`, `code-oss` or `codium`.
+#[cfg(not(windows))]
+fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dirs = std::env::var_os("PATH")?;
+    for name in [stem, "code-oss", "codium", "vscodium"] {
+        if stem != "code" && name != stem {
+            continue;
+        }
+        for dir in std::env::split_paths(&dirs) {
+            let candidate = dir.join(name);
+            let runnable = std::fs::metadata(&candidate)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            if runnable {
                 return Some(candidate);
             }
         }
@@ -363,6 +436,13 @@ pub fn show_settings_window(app: &AppHandle) {
 #[tauri::command]
 fn open_settings_window(app: AppHandle) {
     show_settings_window(&app);
+}
+
+/// Entry point. Linux has to pick the GDK backend before GTK starts.
+pub fn main() {
+    #[cfg(target_os = "linux")]
+    linux::pick_backend();
+    run();
 }
 
 pub fn run() {

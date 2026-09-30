@@ -1,6 +1,7 @@
-// Named-pipe server for coucou-hook.
+// Relay server for coucou-hook: a named pipe on Windows, a Unix socket on Linux.
 //
-// `\\.\pipe\coucou-<sid>` — one instance per connection. Every hook event is
+// `\\.\pipe\coucou-<sid>` — one instance per connection. On Linux it is
+// `$XDG_RUNTIME_DIR/coucou.sock`, in the user's private runtime directory. Every hook event is
 // forwarded to the island as a `hook` event. `PermissionRequest` is the only one
 // that keeps its connection open: it waits for the island's decision and writes
 // it back on the same pipe, which is how approving from the island works.
@@ -24,7 +25,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::mpsc;
 
@@ -57,12 +59,80 @@ pub struct Pending(pub Mutex<HashMap<String, mpsc::Sender<Reply>>>);
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// `\\.\pipe\coucou-<sid>` — must match coucou-hook's `pipe_path()` exactly.
+#[cfg(windows)]
 pub fn pipe_name() -> String {
     let key = crate::win_user::current_user_sid()
         .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_else(|_| "user".into()));
     format!(r"\\.\pipe\coucou-{key}")
 }
 
+/// `$XDG_RUNTIME_DIR/coucou.sock` — must match coucou-hook's `socket_path()`.
+/// The runtime directory is private to the user (0700), which is what keeps
+/// other accounts out; coucou-hook also checks who owns the socket.
+#[cfg(unix)]
+pub fn socket_path() -> std::path::PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir.join("coucou.sock"),
+        _ => std::env::temp_dir().join(format!("coucou-{}.sock", unsafe { libc::getuid() })),
+    }
+}
+
+/// How a connection is hung up once it has been answered.
+trait HangUp {
+    fn hang_up(&mut self);
+}
+
+#[cfg(windows)]
+impl HangUp for NamedPipeServer {
+    fn hang_up(&mut self) {
+        let _ = self.disconnect();
+    }
+}
+
+#[cfg(unix)]
+impl HangUp for tokio::net::UnixStream {
+    /// Dropping the stream closes it; nothing else to do.
+    fn hang_up(&mut self) {}
+}
+
+#[cfg(unix)]
+pub fn start(app: AppHandle) {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
+
+    tauri::async_runtime::spawn(async move {
+        let path = socket_path();
+        // The single-instance plugin guarantees nobody else of ours is serving,
+        // so whatever sits at the path is left over from a crash.
+        let _ = std::fs::remove_file(&path);
+        let listener = match UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(err) => {
+                log::line(format!("cannot open the relay socket {}: {err}", path.display()));
+                return;
+            }
+        };
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let me = unsafe { libc::getuid() };
+        loop {
+            let stream = match listener.accept().await {
+                Ok((s, _)) => s,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
+            // Only our own account gets to talk to the island.
+            if stream.peer_cred().map(|c| c.uid() != me).unwrap_or(true) {
+                continue;
+            }
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move { handle(app, stream).await });
+        }
+    });
+}
+
+#[cfg(windows)]
 pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let name = pipe_name();
@@ -95,7 +165,7 @@ pub fn start(app: AppHandle) {
     });
 }
 
-async fn handle(app: AppHandle, mut pipe: NamedPipeServer) {
+async fn handle<S: AsyncRead + AsyncWrite + Unpin + HangUp>(app: AppHandle, mut pipe: S) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -128,7 +198,7 @@ async fn handle(app: AppHandle, mut pipe: NamedPipeServer) {
     if event != "PermissionRequest" {
         log::line(format!("hook {event}"));
         let _ = app.emit_to(WINDOW_LABEL, "hook", payload);
-        let _ = pipe.disconnect();
+        pipe.hang_up();
         return;
     }
 
@@ -151,7 +221,7 @@ async fn handle(app: AppHandle, mut pipe: NamedPipeServer) {
         let _ = pipe.write_all(format!("{d}\n").as_bytes()).await;
         let _ = pipe.flush().await;
     }
-    let _ = pipe.disconnect();
+    pipe.hang_up();
 }
 
 /// Two waits: a short one for "the card is up", then the long one for a human.
