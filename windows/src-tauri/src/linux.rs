@@ -46,6 +46,14 @@ pub fn surface() -> Surface {
 /// shell, so the island goes through XWayland there. `COUCOU_BACKEND=x11`
 /// forces the same anywhere, `COUCOU_BACKEND=wayland` the opposite.
 pub fn pick_backend() {
+    // WebKitGTK's DMA-BUF renderer draws transparent windows black or not at
+    // all on a good share of drivers; the island is mostly transparent.
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+        find_session_display();
+    }
     if std::env::var_os("GDK_BACKEND").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return;
     }
@@ -55,11 +63,51 @@ pub fn pick_backend() {
     if forced == "x11" || (forced != "wayland" && no_layer_shell) {
         std::env::set_var("GDK_BACKEND", "x11");
     }
-    // WebKitGTK's DMA-BUF renderer draws transparent windows black or not at
-    // all on a good share of drivers; the island is mostly transparent.
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+}
+
+/// Started from somewhere with no display — an SSH shell, a systemd unit, a
+/// terminal multiplexer that outlived its session. The user's desktop is
+/// usually still there: join its Wayland socket (and Hyprland's IPC) rather
+/// than letting GTK abort. With no desktop at all, say so and leave cleanly.
+fn find_session_display() {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));
+
+    let mut sockets: Vec<String> = std::fs::read_dir(&runtime)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("wayland-") && !n.ends_with(".lock"))
+        .collect();
+    sockets.sort();
+
+    let Some(socket) = sockets.into_iter().next() else {
+        eprintln!(
+            "coucou: no graphical session found (WAYLAND_DISPLAY and DISPLAY are unset).\n\
+             Start Coucou from your desktop — the app launcher, or a terminal inside it."
+        );
+        std::process::exit(1);
+    };
+    std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+    std::env::set_var("WAYLAND_DISPLAY", &socket);
+
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+        let newest = std::fs::read_dir(runtime.join("hypr"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().join(".socket.sock").exists())
+            .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+        if let Some(dir) = newest {
+            std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", dir.file_name());
+            if std::env::var_os("XDG_CURRENT_DESKTOP").is_none() {
+                std::env::set_var("XDG_CURRENT_DESKTOP", "Hyprland");
+            }
+        }
     }
+    eprintln!("coucou: no display in this shell — joining the desktop session on {socket}");
 }
 
 fn gdk_is_wayland() -> bool {
