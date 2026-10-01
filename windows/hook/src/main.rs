@@ -183,6 +183,11 @@ fn read_event() -> Option<(String, String)> {
         .unwrap_or(arg_event);
     map.insert("hook_event_name".into(), serde_json::Value::String(event.clone()));
     // Which coding agent sent it; the island keeps one pill per agent.
+    // `coucou_agent` is upstream's name for the same tag, set only when an
+    // agent other than Claude Code is named, so both islands understand it.
+    if agent != "claude" {
+        map.insert("coucou_agent".into(), serde_json::Value::String(agent.clone()));
+    }
     map.insert("agent".into(), serde_json::Value::String(agent));
 
     for field in DROPPED_FIELDS {

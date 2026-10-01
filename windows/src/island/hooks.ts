@@ -32,6 +32,25 @@ interface HookPayload {
   tool_input?: Record<string, unknown>;
   /** Linux: the hook's parent processes, nearest first. */
   ancestor_pids?: number[];
+  /** Upstream's agent tag: lowercase, digits and hyphens, ≤ 24 chars. */
+  coucou_agent?: string;
+}
+
+/** Same rule as HookServer.validateAgent on macOS. "claude" is reserved. */
+function validateAgent(raw: string | undefined): string | null {
+  if (!raw || raw.length > 24 || raw === "claude") return null;
+  if (!/^[a-z0-9-]+$/.test(raw)) return null;
+  return raw;
+}
+
+const FALLBACK_COLORS = ["#22C55E", "#EAB308", "#60A5FA", "#E879F9"];
+
+function agentColor(name: string): string {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) {
+    h = (Math.imul(31, h) + name.charCodeAt(i)) | 0;
+  }
+  return FALLBACK_COLORS[Math.abs(h) % FALLBACK_COLORS.length];
 }
 
 const PROJECT_ALIASES: Record<string, string> = {
@@ -119,6 +138,10 @@ function upsert(id: string, projectName: string, cwd: string, pids?: number[]) {
 }
 
 function clearSession(id: string) {
+  if (id.startsWith("agent_")) {
+    State.removeTask(id);
+    return;
+  }
   if (id !== CLAUDE_ID) {
     State.dropAgent(id);
     return;
@@ -179,8 +202,14 @@ function handleHook(island: Island, payload: HookPayload) {
   const cwd = payload.cwd ?? "";
   const raw = lastPathComponent(cwd);
   const projectName = aliasProjectName(raw || "Session");
-  const id = AGENT_TASK_IDS[payload.agent ?? "claude"] ?? CLAUDE_ID;
-  if (id !== CLAUDE_ID && name !== "SessionEnd") {
+  // Claude Code, Codex and OpenCode have pills of their own; any other agent
+  // that tags its events (upstream's coucou_agent) gets a dynamic agent_<name>.
+  const tag = payload.agent ?? payload.coucou_agent ?? "claude";
+  const known = AGENT_TASK_IDS[tag];
+  const external = known ? null : validateAgent(tag);
+  const id = known ?? (external ? `agent_${external}` : CLAUDE_ID);
+  if (external) State.upsertExternalAgent(id, external, agentColor(external));
+  if (id !== CLAUDE_ID && !external && name !== "SessionEnd") {
     State.ensureAgent(id);
     keepAgent(id, name === "Stop" || name === "StopFailure");
     if (name === "SessionStart" || name === "UserPromptSubmit" || name === "PermissionRequest") {
