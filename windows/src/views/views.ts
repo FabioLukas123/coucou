@@ -5,7 +5,10 @@
 import { h, svg, clear, dot, replay } from "./dom";
 import { ICONS } from "./icons";
 import { buildUsage } from "./usage";
-import { CLAUDE_ID, State, TURN_DONE, turnSteps, agentLabel, type AgentTask, type ClaudeSession, type SessionStep } from "../core/state";
+import {
+  CLAUDE_ID, State, TURN_DONE, turnSteps, agentLabel, agentName, agentVoice, isSessionPill, sessionPill,
+  type AgentTask, type ClaudeSession, type SessionStep,
+} from "../core/state";
 import { VIEW_LAYOUTS, fittedHeight, washRGBA, type BotEmoteName, type BotStateName, type IslandViewName, type Wash } from "../core/layout";
 import { createMiniBot, pruneMiniBots } from "../mochi/minibots";
 import { buildPrompt } from "./chat";
@@ -129,7 +132,7 @@ function nowOf(session: ClaudeSession): Now {
     const said = plainWords(session.answer);
     return {
       icon: svg(ICONS.check, 12, { stroke: 3 }), label: "Done", color: COLOR.green,
-      detail: said ? "Claude replied" : "", step: said ? null : shown, words: said,
+      detail: said ? `${agentVoice(session)} replied` : "", step: said ? null : shown, words: said,
     };
   }
   if (last) {
@@ -191,14 +194,19 @@ function agentWho(task: AgentTask | null, label: string): HTMLElement {
  * and, when other sessions are waiting for an answer behind it, how many.
  */
 function sessionWho(label: string): HTMLElement {
-  const task = State.tasks.find((t) => t.id === CLAUDE_ID) ?? State.focusTask;
   const session = State.session;
+  const task = State.tasks.find((t) => t.id === sessionPill(session)) ?? State.focusTask;
   const row = h("div", { class: "who-row" });
   if (task) row.append(dot(task.color, 8), h("span", { class: "n", text: session.id ? sessionName(session) : task.name }));
   row.append(h("span", { text: label }));
   const waiting = State.waiting.length;
   if (waiting > 0) row.append(h("span", { class: "who-waiting", text: `+${waiting} waiting`, title: "Other sessions waiting for an answer" }));
   return row;
+}
+
+/** True when the pill is an agent's and the session in front is its own: the cards are about that session. */
+function showsSession(task: AgentTask | null | undefined): boolean {
+  return !!task && isSessionPill(task.id) && (task.id === CLAUDE_ID || (State.session.id !== "" && sessionPill(State.session) === task.id));
 }
 
 function stack(padLeft: number, padRight: number, ...children: Node[]): HTMLElement {
@@ -365,7 +373,7 @@ function buildOverview(actions: ViewActions, onResize: () => void): ViewHost {
 
       // The Claude pill with a session to show has the session's card; every
       // other pill shows its own, exactly like IntegrationCardView.
-      const session = task?.id === CLAUDE_ID && State.session.id ? State.session : null;
+      const session = task && State.session.id && sessionPill(State.session) === task.id ? State.session : null;
 
       if (task && session) {
         if (mode !== "session") {
@@ -380,7 +388,7 @@ function buildOverview(actions: ViewActions, onResize: () => void): ViewHost {
           // A conversation that has a title goes by it, as it does in Claude
           // Code, with its project after; untitled, the project is its name.
           h("span", { class: "name", text: session.title ?? task.name, title: session.title ?? "" }),
-          h("span", { class: "tool", text: session.title ? task.name : "Claude Code" }),
+          h("span", { class: "tool", text: session.title ? task.name : agentName(session) }),
         );
         // What the session has written so far: the lines added and removed.
         const files = State.sessionFiles;
@@ -530,7 +538,7 @@ function buildApproval(actions: ViewActions): ViewHost {
           }
           if (proposal.truncated) {
             diff.append(
-              h("div", { class: "gh-diff-line hunk" }, h("span", { class: "n", text: "⋯" }), h("span", { class: "s" }), h("span", { class: "t", text: "The rest of this edit is in Claude Code" })),
+              h("div", { class: "gh-diff-line hunk" }, h("span", { class: "n", text: "⋯" }), h("span", { class: "s" }), h("span", { class: "t", text: `The rest of this edit is in ${agentName(State.session)}` })),
             );
           }
           proposed.append(diff);
@@ -670,7 +678,7 @@ function buildQuestion(actions: ViewActions, onResize: () => void): ViewHost {
     if (next === key) return;
     key = next;
 
-    const task = State.tasks.find((t) => t.id === CLAUDE_ID) ?? State.focusTask;
+    const task = State.tasks.find((t) => t.id === sessionPill(State.session)) ?? State.focusTask;
     const q = info?.questions[at];
     clear(who);
     clear(row);
@@ -679,7 +687,7 @@ function buildQuestion(actions: ViewActions, onResize: () => void): ViewHost {
     back.style.display = at > 0 ? "" : "none";
     if (!info || !q) {
       who.append(sessionWho("is asking a question"));
-      title.textContent = task?.steps.at(-1) ?? "Claude needs an answer.";
+      title.textContent = task?.steps.at(-1) ?? `${agentVoice(State.session)} needs an answer.`;
       hint.textContent = "";
       pass.style.display = "none";
       skip.style.display = "none";
@@ -836,7 +844,7 @@ function buildError(actions: ViewActions): ViewHost {
       }
       // A Claude Code session is named by its conversation; n8n and a
       // third-party agent's pill by their own name.
-      who.append(task?.id === CLAUDE_ID ? sessionWho("Claude Code") : agentWho(task, task?.source === "n8n" ? "n8n" : "stopped"));
+      who.append(showsSession(task) ? sessionWho(agentName(State.session)) : agentWho(task, task?.source === "n8n" ? "n8n" : "stopped"));
       title.textContent = task?.source === "n8n" ? "Workflow stopped." : "Session stopped on an error.";
       detail.textContent = task?.steps.at(-1) ?? "No detail available.";
     },
@@ -877,7 +885,7 @@ function buildFinished(actions: ViewActions): ViewHost {
         return;
       }
       // A third-party agent's pill has no session behind it: its name, its last step, and OK.
-      const claude = State.focusTask?.id === CLAUDE_ID;
+      const claude = showsSession(State.focusTask);
       who.append(claude ? sessionWho("finished") : agentWho(State.focusTask, "finished"));
       // What Claude said to end its turn, its first line; its last step otherwise.
       const answer = claude ? firstWords(State.session.answer) : null;

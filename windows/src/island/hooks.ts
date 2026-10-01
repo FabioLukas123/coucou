@@ -13,7 +13,7 @@
 import { Bridge, onEvent } from "../core/bridge";
 import { Sound } from "../core/sound";
 import {
-  AGENT_TASK_IDS, CLAUDE_ID, QUESTION_TOOL, SESSION_UNNAMED, State, TURN_DONE, newSession, newStep,
+  AGENT_TASK_IDS, QUESTION_TOOL, SESSION_UNNAMED, State, TURN_DONE, isSessionPill, newSession, newStep, sessionPill,
   type ChangedFile, type ClaudeClient, type ClaudeSession, type Question, type StepKind, type StepResult,
 } from "../core/state";
 import type { IslandViewName } from "../core/layout";
@@ -48,6 +48,8 @@ export interface HookPayload {
   term_program?: string;
   /** What an edit tool did to its file — added by coucou-hook to PostToolUse. */
   change?: { patch: string; additions: number; deletions: number; truncated: boolean; created: boolean };
+  /** A patch that touched several files (Codex): each one's change, with its path. */
+  changes?: { file_path: string; patch: string; additions: number; deletions: number; truncated: boolean; created: boolean }[];
   /** A few lines of what a tool gave back — added by coucou-hook to PostToolUse. */
   result?: StepResult;
   /** On a PostToolUseFailure: what went wrong. */
@@ -62,7 +64,7 @@ export interface HookPayload {
   last_message?: string;
 }
 
-/** Sessions followed at once: as many as the island has tabs for. */
+/** Sessions followed at once, for each agent: as many as its pill has tabs for. */
 const MAX_SESSIONS = 4;
 /** Files kept for a session, and edits kept for a file. */
 const MAX_FILES = 40;
@@ -173,12 +175,14 @@ const AT_REST: ReadonlySet<string> = new Set(["idle", "finished", "error", "slee
 const resting = (session: ClaudeSession) => AT_REST.has(session.state) && !waits(session);
 
 /** The session an event comes from, told what the event says of it. A new one gets a place. */
-function sessionOf(island: Island, payload: HookPayload): ClaudeSession {
+function sessionOf(island: Island, payload: HookPayload, agent: string): ClaudeSession {
   const id = payload.session_id || ANONYMOUS;
   let session = State.sessions.find((s) => s.id === id);
   if (!session) {
-    session = newSession(id);
+    session = newSession(id, agent);
     State.sessions.push(session);
+    // Codex and OpenCode have a pill while they have a session.
+    State.ensureAgent(sessionPill(session));
     makeRoom(island, session);
   }
   session.client = clientOf(payload);
@@ -194,13 +198,14 @@ function sessionOf(island: Island, payload: HookPayload): ClaudeSession {
 }
 
 /**
- * One session too many: the one that goes is at rest if any is, and the one
- * heard from longest ago. Never the one in front, the one that just came, or
- * one that is waiting for an answer.
+ * One session too many for its agent: the one that goes is at rest if any is,
+ * and the one heard from longest ago. Never the one in front, the one that
+ * just came, or one that is waiting for an answer.
  */
 function makeRoom(island: Island, newcomer: ClaudeSession) {
-  while (State.sessions.length > MAX_SESSIONS) {
-    const old = State.sessions
+  const mine = () => State.sessions.filter((s) => s.agent === newcomer.agent);
+  while (mine().length > MAX_SESSIONS) {
+    const old = mine()
       .filter((s) => s !== newcomer && s.id !== State.frontId && !waits(s))
       .sort((a, b) => Number(resting(b)) - Number(resting(a)) || a.heardAt - b.heardAt)[0];
     if (!old) return;
@@ -217,7 +222,13 @@ function forget(island: Island, session: ClaudeSession) {
   stopWaiting(session);
   State.sessions.splice(at, 1);
   State.changes.delete(session.id);
-  if (session.id !== State.frontId) return;
+  // Its agent's last session: the pill goes back to its usage card, or away.
+  const pill = sessionPill(session);
+  if (!State.sessions.some((s) => sessionPill(s) === pill)) State.dropAgent(pill);
+  if (session.id !== State.frontId) {
+    State.present();
+    return;
+  }
   // It was in front: the one heard from last takes its place.
   const next = [...State.sessions].sort((a, b) => b.heardAt - a.heardAt)[0];
   State.bringForward(next?.id ?? "");
@@ -257,10 +268,13 @@ function sessionPath(file: string, cwd: string): string {
 
 /** One more edit to a file: the file moves to the top of the session's changes. */
 function recordChange(session: ClaudeSession, payload: HookPayload) {
-  const change = payload.change;
   const file = payload.tool_input?.file_path;
-  if (!change || typeof file !== "string") return;
-  const path = sessionPath(file, payload.cwd ?? "");
+  const all = payload.changes ?? (payload.change && typeof file === "string" ? [{ ...payload.change, file_path: file }] : []);
+  for (const change of all) recordFile(session, change.file_path, change, payload.cwd ?? "");
+}
+
+function recordFile(session: ClaudeSession, file: string, change: NonNullable<HookPayload["change"]>, cwd: string) {
+  const path = sessionPath(file, cwd);
   const files = State.changes.get(session.id) ?? [];
   const at = files.findIndex((f) => f.path === path);
   const entry: ChangedFile =
@@ -554,7 +568,9 @@ export function handleHook(island: Island, payload: HookPayload) {
   // Route to the right pill. Valid coucou_agent → dynamic "agent_<name>" pill.
   // "claude" is reserved; absent or invalid → Claude Code, as before.
   const agent = validateAgent(payload.agent ?? payload.coucou_agent);
-  if (agent && !State.paused) return handleAgent(island, payload, agent);
+  // Codex and OpenCode are followed like Claude Code, journal and all; any
+  // other agent only has a pill.
+  if (agent && !AGENT_TASK_IDS[agent] && !State.paused) return handleAgent(island, payload, agent);
 
   // Paused, or a session nobody is sitting in front of: the island does not look.
   if (State.paused || isAutomated(payload)) {
@@ -574,11 +590,17 @@ export function handleHook(island: Island, payload: HookPayload) {
     return;
   }
 
-  const session = sessionOf(island, payload);
-  if (takesFront(session, name)) State.bringForward(session.id);
+  const session = sessionOf(island, payload, agent ?? "claude");
+  /** The pill that follows it: Claude Code's, Codex's or OpenCode's. */
+  const pill = sessionPill(session);
+  if (takesFront(session, name)) {
+    State.bringForward(session.id);
+    // Looking at another agent's session: the island moves on to this one's pill.
+    if (isSessionPill(State.focusId) && State.focusId !== pill) State.focusId = pill;
+  }
   /** The session the island shows; the others go on behind their tabs. */
   const front = session.id === State.frontId;
-  const focused = front && State.focusId === CLAUDE_ID;
+  const focused = front && State.focusId === pill;
   const cwd = payload.cwd ?? "";
 
   /** Alerts force the island open; work events only reveal the compact island. */
@@ -600,7 +622,7 @@ export function handleHook(island: Island, payload: HookPayload) {
   const tell = (what: "finished" | "error") => {
     if (focused) return surface(what, true);
     if (!front) session.news = what;
-    if (State.focusId !== CLAUDE_ID) State.setPillBadge(CLAUDE_ID, what);
+    if (State.focusId !== pill) State.setPillBadge(pill, what);
   };
 
   switch (name) {
@@ -675,7 +697,7 @@ export function handleHook(island: Island, payload: HookPayload) {
       window.setTimeout(() => {
         // Still where its turn left it: back to rest. Its tab keeps its mark.
         if (session.state === "finished") session.state = "idle";
-        if (session.id === State.frontId) State.setPillBadge(CLAUDE_ID, null);
+        if (session.id === State.frontId) State.setPillBadge(pill, null);
         State.present();
       }, FINISHED_MS);
       break;
@@ -740,7 +762,7 @@ export function handleHook(island: Island, payload: HookPayload) {
         // is the signal instead — but it has to be on screen for that to mean
         // anything, hence the reveal. We just told the relay a human can act.
         State.isPinned = true;
-        State.setPillBadge(CLAUDE_ID, "approval");
+        State.setPillBadge(pill, "approval");
         island.reveal();
       }
       pendingTimeouts.set(session.id, window.setTimeout(() => {

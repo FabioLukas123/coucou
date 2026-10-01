@@ -170,6 +170,8 @@ export function turnSteps(session: ClaudeSession): SessionStep[] {
  */
 export interface ClaudeSession {
   id: string;
+  /** Whose session it is: "claude", "codex" or "opencode". Each one has its pill. */
+  agent: string;
   client: ClaudeClient | null;
   /** Linux: the session's process chain, so its terminal can be brought forward. */
   pids?: number[];
@@ -200,9 +202,9 @@ export interface ClaudeSession {
 /** What a session is called before its folder is known. */
 export const SESSION_UNNAMED = "Session";
 
-export function newSession(id: string): ClaudeSession {
+export function newSession(id: string, agent = "claude"): ClaudeSession {
   return {
-    id, client: null, title: null, project: SESSION_UNNAMED, cwd: null, state: "idle",
+    id, agent, client: null, title: null, project: SESSION_UNNAMED, cwd: null, state: "idle",
     lines: [], steps: [], asked: null, answer: null, answeredAt: 0,
     approval: null, question: null, news: null, heardAt: 0,
   };
@@ -236,6 +238,28 @@ export const AGENT_TASK_IDS: Record<string, string> = {
   codex: "integration_codex",
   opencode: "integration_opencode",
 };
+
+/** The pill a session is followed in: its agent's. */
+export function sessionPill(session: ClaudeSession): string {
+  return AGENT_TASK_IDS[session.agent] ?? "integration_claude";
+}
+
+/** True for a pill that follows sessions — Claude Code's, Codex's, OpenCode's. */
+export function isSessionPill(id: string | null | undefined): boolean {
+  return id != null && Object.values(AGENT_TASK_IDS).includes(id);
+}
+
+const AGENT_NAMES: Record<string, string> = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
+
+/** The agent a session runs in, by name: "Claude Code", "Codex", "OpenCode". */
+export function agentName(session: ClaudeSession): string {
+  return AGENT_NAMES[session.agent] ?? "Claude Code";
+}
+
+/** Who speaks at the end of a turn: Claude, Codex, OpenCode. */
+export function agentVoice(session: ClaudeSession): string {
+  return session.agent === "claude" ? "Claude" : agentName(session);
+}
 
 export function isAgentTask(id: string | undefined | null): boolean {
   return id === "integration_claude" || id === "integration_codex" || id === "integration_opencode"
@@ -435,16 +459,29 @@ class AppState {
     this.present();
   }
 
-  /** The Claude pill wears the session in front: its project, its state, its steps. */
+  /**
+   * The session a pill follows: the one in front when it is that pill's, or
+   * else the one of its agent heard from last.
+   */
+  sessionOf(pill: string): ClaudeSession | null {
+    if (this.frontId && sessionPill(this.session) === pill) return this.session;
+    return this.sessions.filter((s) => sessionPill(s) === pill).sort((a, b) => b.heardAt - a.heardAt)[0] ?? null;
+  }
+
+  /** Each agent's pill wears its session: its project, its state, its steps. */
   present() {
-    const t = this.tasks.find((x) => x.id === CLAUDE_ID);
-    if (!t) return;
-    const s = this.session;
-    t.name = s.id ? s.project : this.clientName;
-    t.state = s.state;
-    t.steps = s.lines;
-    t.stepIndex = Math.max(0, s.lines.length - 1);
-    t.sessionCwd = s.cwd;
+    for (const id of Object.values(AGENT_TASK_IDS)) {
+      const t = this.tasks.find((x) => x.id === id);
+      if (!t) continue;
+      const s = this.sessionOf(id) ?? this.noSession;
+      const proto = INTEGRATION_AGENTS.find((x) => x.id === id);
+      t.name = s.id ? s.project : id === CLAUDE_ID ? this.clientName : proto?.name ?? t.name;
+      t.state = s.state;
+      t.steps = s.lines;
+      t.stepIndex = Math.max(0, s.lines.length - 1);
+      t.sessionCwd = s.cwd;
+      t.sessionPids = s.pids;
+    }
     this.notify();
   }
 
@@ -467,6 +504,9 @@ class AppState {
     if (!t) return;
     this.focusId = id;
     t.pillBadge = null;
+    // An agent's pill shows that agent's session: it comes to the front.
+    const follows = isSessionPill(id) ? this.sessionOf(id) : null;
+    if (follows && follows.id !== this.frontId) this.bringForward(follows.id);
     this.notify();
   }
 

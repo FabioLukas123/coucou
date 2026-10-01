@@ -22,7 +22,7 @@ import { ICONS } from "./icons";
 import { COLOR } from "./palette";
 import { timeAgo } from "./integrations";
 import { markdown } from "./markdown";
-import { CLAUDE_ID, State, type ChangedFile, type ClaudeSession, type SessionStep } from "../core/state";
+import { State, agentName, agentVoice, sessionPill, type ChangedFile, type ClaudeSession, type SessionStep } from "../core/state";
 import { stepIcon, stepName, stepPreview, type ToType } from "./step";
 import { botGlowColor } from "../core/layout";
 import type { ViewActions, ViewHost } from "./views";
@@ -90,7 +90,9 @@ function standing(session: ClaudeSession): { color: string; words: string } {
 export function sessionTabs(el: HTMLElement, onPick: (id: string) => void): () => number {
   const tabs = new Map<string, { tab: HTMLElement; mark: HTMLElement; label: HTMLElement }>();
   return () => {
-    const behind = State.sessions.filter((s) => s.id !== State.frontId);
+    // The other sessions of the same agent: each pill has its own.
+    const pill = sessionPill(State.session);
+    const behind = State.sessions.filter((s) => s.id !== State.frontId && sessionPill(s) === pill);
     for (const [id, { tab }] of tabs) {
       if (behind.some((s) => s.id === id)) continue;
       tab.remove();
@@ -159,7 +161,7 @@ function diffView(file: ChangedFile, kind: FileKind): HTMLElement {
       }
       diff.append(diffLine(line.new ?? line.old, line.sign, line.text, kind));
     }
-    if (edit.truncated) diff.append(diffBreak("The rest of this edit is in Claude Code"));
+    if (edit.truncated) diff.append(diffBreak(`The rest of this edit is in ${agentName(State.session)}`));
   });
   return h("div", { class: "gh-code" }, diff);
 }
@@ -203,7 +205,7 @@ function askedView(step: SessionStep): HTMLElement {
     el.append(h("div", { class: "jr-q" }, h("div", { class: "jr-q-title", text: q.question }), options));
   }
   if (!step.answers) {
-    el.append(h("div", { class: "jr-waiting", text: step.state === "running" ? "Waiting for an answer…" : step.state === "failed" ? "Left unanswered." : "Answered in Claude Code." }));
+    el.append(h("div", { class: "jr-waiting", text: step.state === "running" ? "Waiting for an answer…" : step.state === "failed" ? "Left unanswered." : `Answered in ${agentName(State.session)}.` }));
   }
   return el;
 }
@@ -221,7 +223,7 @@ function journalEntry(step: SessionStep, typed?: ToType[]): HTMLElement {
     return h(
       "div",
       { class: "jr jr-reply" },
-      h("div", { class: "sess-said" }, dot(COLOR.green, 6), h("b", { text: "Claude" }), h("span", { text: clock(step.at) })),
+      h("div", { class: "sess-said" }, dot(COLOR.green, 6), h("b", { text: agentVoice(State.session) }), h("span", { text: clock(step.at) })),
       step.target ? markdown(step.target) : h("div", { class: "jr-waiting", text: "The turn ended without a word." }),
     );
   }
@@ -419,7 +421,7 @@ export function buildSession(actions: ViewActions): ViewHost {
       wanted.push(entry.el);
     }
     if (wanted.length === 0) {
-      empty.textContent = session.id ? "Nothing has happened in this session yet." : "No Claude Code session yet.";
+      empty.textContent = session.id ? "Nothing has happened in this session yet." : "No session yet.";
       wanted.push(empty);
     }
     const same = journal.children.length === wanted.length && wanted.every((node, i) => journal.children[i] === node);
@@ -445,22 +447,22 @@ export function buildSession(actions: ViewActions): ViewHost {
   return {
     el,
     sync() {
-      const task = State.tasks.find((t) => t.id === CLAUDE_ID) ?? null;
       const session = State.session;
+      const task = State.tasks.find((t) => t.id === sessionPill(session)) ?? null;
       const files = State.sessionFiles;
 
       // The column: whose session, where it runs, and its last steps — fewer
       // of them when other sessions take a line each at its foot.
       const shown = session.steps.filter((s) => !NOT_A_STEP.has(s.kind)).slice(-Math.max(1, STEPS_SHOWN - syncOthers()));
-      const nextSteps = [task?.name, session.title, ...shown.map((s) => `${s.tool}:${s.state}:${s.at}`)].join("~");
+      const nextSteps = [task?.name, session.title, session.agent, ...shown.map((s) => `${s.tool}:${s.state}:${s.at}`)].join("~");
       if (nextSteps !== stepsKey) {
         stepsKey = nextSteps;
         // The conversation by its title, and under it the project it works in;
         // untitled, the project is its name.
-        const project = task?.name ?? UNNAMED;
+        const project = task?.name ?? agentName(session);
         name.textContent = session.title ?? project;
         name.title = session.title ?? "";
-        nameSub.textContent = session.title ? project : UNNAMED;
+        nameSub.textContent = session.title ? project : agentName(session);
         clear(steps);
         for (const s of shown) {
           const mark = STEP_ICONS[s.state]();

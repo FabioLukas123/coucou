@@ -10,7 +10,7 @@ import {
   type BotStateName, type IslandMode, type IslandViewName,
 } from "../core/layout";
 import { Sound } from "../core/sound";
-import { CLAUDE_ID, QUESTION_TOOL, State, isAgentTask, type SessionStep } from "../core/state";
+import { CLAUDE_ID, QUESTION_TOOL, State, isAgentTask, isSessionPill, sessionPill, type SessionStep } from "../core/state";
 import { BotEngine, hexToRGB, type RGB } from "../mochi/engine";
 import { Greeting } from "../mochi/greeting";
 import { createMiniBot, pruneMiniBots, syncMiniBotStates, tickMiniBots } from "../mochi/minibots";
@@ -193,17 +193,17 @@ export class Island {
         State.setFocus(id);
         Sound.play("blip");
         // A request that came in while another pill had the front only left a
-        // badge: bringing Claude's pill forward is asking for its card.
-        if (id !== CLAUDE_ID) return;
+        // badge: bringing its agent's pill forward is asking for its card.
+        if (!isSessionPill(id)) return;
         if (State.pendingQuestion) this.setView("question");
         else if (State.pendingApproval) this.setView("approval");
         // No card for the session in front, but one behind it is waiting: its turn.
         else if (State.waiting.length > 0) this.afterRequest(true);
       },
       openTerminal: () => {
-        // Claude Code's sessions know their client; Codex and OpenCode, their terminal.
+        // A session in front knows where it runs; another agent's pill, its terminal.
         const task = State.focusTask;
-        if (task && task.id !== CLAUDE_ID && isAgentTask(task.id)) {
+        if (task && !isSessionPill(task.id) && isAgentTask(task.id)) {
           void Bridge.openSession(task.sessionCwd ?? null, task.sessionPids ?? null);
         } else {
           this.openClient();
@@ -221,7 +221,7 @@ export class Island {
           integration_notion: "https://notion.so",
           integration_calcom: "https://app.cal.com/bookings",
         };
-        if (task.id === CLAUDE_ID) this.openClient();
+        if (isSessionPill(task.id) && State.session.id && sessionPill(State.session) === task.id) this.openClient();
         else if (isAgentTask(task.id)) void Bridge.openSession(task.sessionCwd ?? null, task.sessionPids ?? null);
         else if (task.id === "integration_n8n") void Bridge.openN8n();
         else if (task.id === "integration_github" && githubData()) void Bridge.openUrl(githubData()!.profileUrl);
@@ -480,7 +480,8 @@ export class Island {
     if (next) State.bringForward(next.id);
     State.isPinned = next != null;
     this.fsm.pinned = next != null;
-    State.setPillBadge(CLAUDE_ID, next && State.focusId !== CLAUDE_ID ? "approval" : null);
+    const pill = sessionPill(next ?? State.session);
+    State.setPillBadge(pill, next && State.focusId !== pill ? "approval" : null);
     State.present();
     if (show) this.setView(next ? (next.question ? "question" : "approval") : State.defaultView());
   }

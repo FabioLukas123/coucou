@@ -295,6 +295,10 @@ fn change_of(response: &serde_json::Value) -> Option<serde_json::Value> {
 /// step: the end of what a command printed, the start of a file that was read,
 /// what a search found. Nothing else of a tool's response leaves the relay.
 fn result_of(tool: &str, response: &serde_json::Value) -> Option<serde_json::Value> {
+    // Codex hands a command's output over as the reply itself.
+    if let Some(printed) = response.as_str() {
+        return COMMAND_TOOLS.contains(&tool).then(|| excerpt(&plain(printed), None, true)).flatten();
+    }
     let text = |key: &str| response.get(key).and_then(|v| v.as_str()).unwrap_or_default();
     let names = || {
         let files = response.get("filenames").and_then(|v| v.as_array());
@@ -423,6 +427,102 @@ fn proposal_of(tool: &str, input: &serde_json::Value) -> Option<serde_json::Valu
     diff_of(before.as_deref().unwrap_or_default(), &after, !exists)
 }
 
+/// Codex's edit tool (OpenCode's too, with GPT models): one patch, any number
+/// of files. Its reply only says which files it touched, not how.
+const PATCH_TOOL: &str = "apply_patch";
+/// The lines of such a patch that name a file.
+const PATCH_FILE_LINES: &[&str] = &["*** Update File: ", "*** Add File: ", "*** Delete File: ", "*** Move to: "];
+/// A file's copy no edit came back for is left this long, then swept away.
+const SNAPSHOT_TTL: Duration = Duration::from_secs(600);
+
+/// A path as the agent gave it, made whole against the session's folder.
+fn absolute(path: &str, cwd: &str) -> String {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() || cwd.is_empty() {
+        path.to_string_lossy().to_string()
+    } else {
+        std::path::Path::new(cwd).join(path).to_string_lossy().to_string()
+    }
+}
+
+/// The files an edit by an agent other than Claude Code is about to change:
+/// the one it names, or each one its patch names.
+fn edited_files(tool: &str, input: &serde_json::Value, cwd: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    if tool == PATCH_TOOL {
+        let text = ["command", "patchText", "patch", "input"]
+            .iter()
+            .find_map(|key| input.get(*key).and_then(|v| v.as_str()))
+            .unwrap_or_default();
+        for line in text.lines() {
+            if let Some(path) = PATCH_FILE_LINES.iter().find_map(|prefix| line.strip_prefix(prefix)) {
+                let path = absolute(path.trim(), cwd);
+                if !files.contains(&path) {
+                    files.push(path);
+                }
+            }
+        }
+    } else if EDIT_TOOLS.contains(&tool) {
+        if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
+            files.push(absolute(path, cwd));
+        }
+    }
+    files
+}
+
+/// Where a file's copy from before an edit waits for the edit to end.
+fn snapshot_path(session: &str, file: &str) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (session, file).hash(&mut hasher);
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    dir.join("coucou-edits").join(format!("{:016x}", hasher.finish()))
+}
+
+/// Before the edit: a copy of each file as it is ("1" and its text), or a
+/// mark that it is not there yet ("0"). A file too large to diff gets none.
+fn snapshot(session: &str, files: &[String]) {
+    let Some(dir) = snapshot_path(session, "").parent().map(std::path::Path::to_path_buf) else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    // Copies whose edit never ended — a tool that failed, a session killed.
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let stale = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > SNAPSHOT_TTL);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    for file in files {
+        let copy = match read_text(file) {
+            Some(text) => format!("1{text}"),
+            None if !std::path::Path::new(file).exists() => "0".to_string(),
+            None => continue,
+        };
+        let _ = std::fs::write(snapshot_path(session, file), copy);
+    }
+}
+
+/// After the edit: what changed in each file since its copy was taken, file by file.
+fn changes_since(session: &str, files: &[String]) -> Vec<(String, serde_json::Value)> {
+    let mut out = Vec::new();
+    for file in files {
+        let path = snapshot_path(session, file);
+        let Ok(copy) = std::fs::read_to_string(&path) else { continue };
+        let _ = std::fs::remove_file(&path);
+        let before = copy.strip_prefix('1');
+        let after = read_text(file);
+        if before.is_none() && after.is_none() {
+            continue;
+        }
+        let created = before.is_none();
+        if let Some(change) = diff_of(before.unwrap_or_default(), after.as_deref().unwrap_or_default(), created) {
+            out.push((file.clone(), change));
+        }
+    }
+    out
+}
+
 /// The conversation's title, as Claude Code last wrote it in the session's
 /// transcript. That file's format is Claude Code's own and may change: whatever
 /// goes wrong here, there is simply no title. Only the file's end is read — a
@@ -513,6 +613,14 @@ fn read_event() -> Option<Event> {
     if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
         raw.drain(..3);
     }
+    // Debugging aid: COUCOU_HOOK_DUMP=<file> appends every raw event to it,
+    // to see exactly what an agent sends.
+    if let Some(path) = std::env::var_os("COUCOU_HOOK_DUMP") {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = file.write_all(&raw);
+            let _ = file.write_all(b"\n");
+        }
+    }
 
     let mut payload = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
     let map = payload.as_object_mut()?;
@@ -530,16 +638,38 @@ fn read_event() -> Option<Event> {
     // Which coding agent sent it; the island keeps one pill per agent.
     // `coucou_agent` is upstream's name for the same tag, set only when an
     // agent other than Claude Code is named, so both islands understand it.
-    if agent != "claude" {
+    let agent_is_claude = agent == "claude";
+    if !agent_is_claude {
         map.insert("coucou_agent".into(), serde_json::Value::String(agent.clone()));
     }
     map.insert("agent".into(), serde_json::Value::String(agent));
 
-    let tool = map.get("tool_name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let mut tool = map.get("tool_name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     // Before anything is cut or dropped: what an edit did, and a question whole.
-    let change = (event == "PostToolUse" && EDIT_TOOLS.contains(&tool.as_str()))
+    let mut change = (event == "PostToolUse" && agent_is_claude && EDIT_TOOLS.contains(&tool.as_str()))
         .then(|| map.get("tool_response").and_then(change_of))
         .flatten();
+    // Codex and OpenCode say nothing of what an edit did: the relay copies the
+    // files before it and diffs them after. A patch becomes an edit like
+    // Claude's, of its first file, with every file it touched beside.
+    let mut changes = Vec::new();
+    if !agent_is_claude && (tool == PATCH_TOOL || EDIT_TOOLS.contains(&tool.as_str())) {
+        let cwd = map.get("cwd").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let session = map.get("session_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let input = map.get("tool_input").cloned().unwrap_or_default();
+        let files = edited_files(&tool, &input, &cwd);
+        match event.as_str() {
+            "PreToolUse" => snapshot(&session, &files),
+            "PostToolUse" | "PostToolUseFailure" => changes = changes_since(&session, &files),
+            _ => {}
+        }
+        if tool == PATCH_TOOL {
+            tool = "Edit".to_string();
+            map.insert("tool_name".into(), serde_json::Value::String(tool.clone()));
+            map.insert("tool_input".into(), serde_json::json!({ "file_path": files.first(), "files": files }));
+        }
+        change = changes.first().map(|(_, change)| change.clone());
+    }
     // A few lines of what the tool gave back, to show under its step.
     let result = (event == "PostToolUse")
         .then(|| map.get("tool_response").and_then(|response| result_of(&tool, response)))
@@ -623,6 +753,15 @@ fn read_event() -> Option<Event> {
     // After the cut: a diff is already capped, and far longer than a field.
     if let Some(change) = change {
         payload["change"] = change;
+    }
+    if changes.len() > 1 {
+        payload["changes"] = changes
+            .into_iter()
+            .map(|(file, mut change)| {
+                change["file_path"] = serde_json::Value::String(file);
+                change
+            })
+            .collect();
     }
     if let Some(proposal) = proposal {
         payload["proposal"] = proposal;
@@ -729,6 +868,38 @@ fn talk(payload: &str, waits_for_answer: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_patch_names_its_files_whole() {
+        let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-x\n+y\n*** Add File: /abs/b.md\n+hi\n*** Update File: src/a.rs\n*** End Patch";
+        let input = serde_json::json!({ "command": patch });
+        assert_eq!(edited_files(PATCH_TOOL, &input, "/work"), vec!["/work/src/a.rs", "/abs/b.md"]);
+        let edit = serde_json::json!({ "file_path": "/work/c.txt" });
+        assert_eq!(edited_files("Edit", &edit, "/work"), vec!["/work/c.txt"]);
+        assert!(edited_files("Bash", &input, "/work").is_empty());
+    }
+
+    #[test]
+    fn an_edit_is_diffed_against_its_copy() {
+        let dir = std::env::temp_dir().join(format!("coucou-hook-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.txt"), dir.join("new.txt"));
+        std::fs::write(&old, "one\ntwo\nthree\n").unwrap();
+        let _ = std::fs::remove_file(&new);
+        let files = vec![old.to_string_lossy().to_string(), new.to_string_lossy().to_string()];
+        let session = format!("test-{}", std::process::id());
+        snapshot(&session, &files);
+        std::fs::write(&old, "one\nTWO\nthree\n").unwrap();
+        std::fs::write(&new, "hello\n").unwrap();
+        let changes = changes_since(&session, &files);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].1["patch"], "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n");
+        assert_eq!(changes[1].1["created"], true);
+        assert_eq!(changes[1].1["additions"], 1);
+        // The copies are used once.
+        assert!(changes_since(&session, &files).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn decision_json_matches_the_documented_shape() {
