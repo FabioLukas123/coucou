@@ -613,7 +613,9 @@ fn give_bar_back_on_signals() {
             let mut sig = 0;
             libc::sigwait(&set, &mut sig);
             restore_bar_now();
-            std::process::exit(128 + sig);
+            // _exit, not exit: running the atexit handlers from this thread
+            // while GTK and WebKit are still alive on the main one segfaults.
+            libc::_exit(128 + sig);
         });
     }
 }
