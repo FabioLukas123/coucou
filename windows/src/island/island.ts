@@ -76,6 +76,48 @@ export class Island {
   private toldOpen = false;
   /** The bar is away (hidden by the shell or another display's island). */
   private suppressed = false;
+
+  /**
+   * The island is open because the user opened it (a click), not because news
+   * came in. Only then does a click elsewhere, or Esc, close it — a card that
+   * popped up on its own must never swallow a click meant for another window.
+   */
+  private openedByUser = false;
+  /** What Rust was last told: a click elsewhere closes this island. */
+  private dismissable = false;
+  /** Why the island wants the keyboard right now: the chat, a field, Esc. */
+  private keyboardReasons = new Set<string>();
+  private keyboardOn = false;
+
+  /** Asks for the keyboard (or gives it back) for one reason among several. */
+  setKeyboard(reason: string, on: boolean) {
+    if (on) this.keyboardReasons.add(reason);
+    else this.keyboardReasons.delete(reason);
+    const want = this.keyboardReasons.size > 0;
+    if (want === this.keyboardOn) return;
+    this.keyboardOn = want;
+    void Bridge.focusWindow(want);
+  }
+
+  /**
+   * Opened by the user and not held open by a request: a click elsewhere
+   * closes it, and Esc does while the pointer is over it (the keyboard is
+   * only borrowed then, so typing elsewhere is never lost).
+   */
+  private syncDismiss() {
+    if (State.mode !== "expanded") this.openedByUser = false;
+    const on = State.mode === "expanded" && this.openedByUser && !State.isPinned;
+    if (on !== this.dismissable) {
+      this.dismissable = on;
+      void Bridge.setDismissable(on);
+    }
+    this.setKeyboard("esc", on && this.wasInIsland);
+  }
+
+  /** A click landed outside the island (Rust's catcher). */
+  dismiss() {
+    if (State.mode === "expanded" && !State.isPinned) this.collapse();
+  }
   private botCx = new Spring(46);
   private botCy = new Spring(16);
   private botSize = new Spring(10);
@@ -221,7 +263,7 @@ export class Island {
         void Bridge.approvalDecline(req.requestId);
         this.settleRequest();
       },
-      keyboard: (on) => void Bridge.focusWindow(on),
+      keyboard: (on) => this.setKeyboard("field", on),
       openSession: (changes) => {
         enterSessionPanel(changes === true);
         this.setView("session");
@@ -357,6 +399,9 @@ export class Island {
     if (prev === "expanded") {
       Sound.play("close");
       State.isPinned = false;
+      // A closed island never keeps the keyboard, whatever asked for it.
+      this.keyboardReasons.clear();
+      this.keyboardOn = false;
       void Bridge.focusWindow(false);
     }
     if (mode !== "expanded") {
@@ -477,6 +522,8 @@ export class Island {
 
   /** Alert from the hook server: open on this view. Pinned alerts never auto-close. */
   alert(view: IslandViewName) {
+    // News opened it (unless the user already had it open).
+    if (State.mode !== "expanded") this.openedByUser = false;
     this.fsm.pinned = State.isPinned;
     this.fsm.forceHome();
     this.expand(view);
@@ -757,6 +804,7 @@ export class Island {
       Sound.resume();
       State.lastActivity = performance.now();
       if (State.mode !== "expanded") {
+        this.openedByUser = true;
         this.fsm.click();
         return;
       }
@@ -838,7 +886,10 @@ export class Island {
         this.homeCollapseAt = performance.now() + State.settings.autoCloseInterval * 1000;
       }
     }
-    this.wasInIsland = inIsland;
+    if (inIsland !== this.wasInIsland) {
+      this.wasInIsland = inIsland;
+      this.syncDismiss();
+    }
 
     // Bot hover → love
     const overBot = State.mode === "expanded" && State.stateOverride == null && this.isBotHit(x, y);
@@ -1137,12 +1188,14 @@ export class Island {
       const wasChat = this.lastSyncedView === "prompt";
       this.lastSyncedView = State.view;
       if (State.view === "prompt") {
-        void Bridge.focusWindow(true);
+        this.setKeyboard("chat", true);
         window.setTimeout(() => this.views.get("prompt")?.focus?.(), 120);
       } else if (wasChat) {
-        void Bridge.focusWindow(false);
+        this.setKeyboard("chat", false);
       }
     }
+    // Opened by the user, pinned by a request, closed: who may close it changes.
+    this.syncDismiss();
 
     // Compact mini grid
     const showGrid = State.mode === "compact";

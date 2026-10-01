@@ -101,7 +101,8 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
       e.preventDefault();
       void submit();
     }
-    e.stopPropagation(); // Escape closes the island, not the chat
+    // Typing stays in the chat; Escape goes on up and closes the island.
+    if ((e as KeyboardEvent).key !== "Escape") e.stopPropagation();
   });
 
   return {

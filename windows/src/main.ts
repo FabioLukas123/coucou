@@ -58,6 +58,9 @@ async function main() {
   // The bar went away (media island, another display's open island) or came back.
   await onEvent<boolean>("suppressed", (quiet) => island.setSuppressed(quiet));
 
+  // Linux: a click anywhere outside an island the user opened closes it.
+  await onEvent<null>("dismiss", () => island.dismiss());
+
   await onEvent<null>("screen-changed", async () => island.setBar(await Bridge.reposition()));
 
   // The settings window writes preferences; apply them here without a restart.

@@ -71,6 +71,12 @@ export const Bridge = {
   /** Places this island again; resolves with the bar it now sits in. */
   reposition: () => call<Bar | null>("reposition"),
 
+  /**
+   * Linux: the island is open because the user opened it, so a click anywhere
+   * else closes it (Rust lays a see-through catcher under it).
+   */
+  setDismissable: (on: boolean) => call<void>("set_dismissable", { on }),
+
   /** Bar mode: the island opened or closed — Rust hides or shows the bar. */
   islandOpen: (open: boolean) => call<void>("island_open", { open }),
 

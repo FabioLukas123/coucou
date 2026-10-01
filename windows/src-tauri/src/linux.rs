@@ -723,3 +723,105 @@ mod focus_tests {
         assert!(super::focus_session_window(&pids));
     }
 }
+
+// ── Closing the island by clicking anywhere else ─────────────────────────────
+//
+// A layer surface hears nothing of clicks outside its input region, so while
+// the user has the island open a transparent "catcher" covers every display,
+// one layer below the island (Top; the island is Overlay). A click anywhere
+// but on the island lands on it and closes the island, the way a popover
+// closes. Only for an island the user opened: one that opened on its own for
+// news must never swallow a click meant for the window underneath.
+
+/// Islands the user opened and a click elsewhere should close.
+static DISMISSABLE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+thread_local! {
+    /// The catchers, one per display; main thread only, like all GTK.
+    static CATCHERS: std::cell::RefCell<Vec<gtk::Window>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Island `label` may (or may no longer) be closed by a click elsewhere.
+pub fn set_dismissable(app: &tauri::AppHandle, label: &str, on: bool) {
+    let any = {
+        let mut list = DISMISSABLE.lock().unwrap();
+        list.retain(|l| l != label);
+        if on {
+            list.push(label.to_string());
+        }
+        !list.is_empty()
+    };
+    let app = app.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        if any { show_catchers(&app) } else { hide_catchers() }
+    });
+}
+
+fn show_catchers(app: &tauri::AppHandle) {
+    if surface() != Surface::Layer {
+        return;
+    }
+    CATCHERS.with(|cell| {
+        let mut list = cell.borrow_mut();
+        if !list.is_empty() {
+            return;
+        }
+        let Some(display) = gtk::gdk::Display::default() else { return };
+        for i in 0..display.n_monitors() {
+            let Some(monitor) = display.monitor(i) else { continue };
+            let win = gtk::Window::new(gtk::WindowType::Toplevel);
+            win.set_app_paintable(true);
+            if let Some(visual) = GtkWindowExt::screen(&win).and_then(|s| s.rgba_visual()) {
+                win.set_visual(Some(&visual));
+            }
+            win.init_layer_shell();
+            win.set_namespace("coucou-dismiss");
+            win.set_layer(gtk_layer_shell::Layer::Top);
+            for edge in [
+                gtk_layer_shell::Edge::Top,
+                gtk_layer_shell::Edge::Bottom,
+                gtk_layer_shell::Edge::Left,
+                gtk_layer_shell::Edge::Right,
+            ] {
+                win.set_anchor(edge, true);
+            }
+            win.set_exclusive_zone(-1);
+            win.set_keyboard_mode(gtk_layer_shell::KeyboardMode::None);
+            win.set_monitor(&monitor);
+            // Fully see-through: nothing of it is ever drawn.
+            win.connect_draw(|_, cr| {
+                cr.set_operator(gtk::cairo::Operator::Source);
+                cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+                let _ = cr.paint();
+                gtk::glib::Propagation::Stop
+            });
+            win.add_events(gtk::gdk::EventMask::BUTTON_PRESS_MASK);
+            let handle = app.clone();
+            win.connect_button_press_event(move |_, _| {
+                dismiss_all(&handle);
+                gtk::glib::Propagation::Stop
+            });
+            win.show_all();
+            list.push(win);
+        }
+    });
+}
+
+fn hide_catchers() {
+    CATCHERS.with(|cell| {
+        for win in cell.borrow_mut().drain(..) {
+            // SAFETY: GTK-owned toplevel created above, destroyed on its own thread.
+            unsafe { win.destroy() };
+        }
+    });
+}
+
+/// A click outside: every island the user opened closes.
+fn dismiss_all(app: &tauri::AppHandle) {
+    use tauri::Emitter;
+    let labels: Vec<String> = std::mem::take(&mut *DISMISSABLE.lock().unwrap());
+    for label in labels {
+        let _ = app.emit_to(label.as_str(), "dismiss", ());
+    }
+    hide_catchers();
+}

@@ -341,6 +341,18 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
+/// Linux: the user opened the island (or it closed): while it is open, a
+/// click anywhere else closes it.
+#[tauri::command]
+fn set_dismissable(
+    #[allow(unused_variables)] app: AppHandle,
+    #[allow(unused_variables)] window: WebviewWindow,
+    #[allow(unused_variables)] on: bool,
+) {
+    #[cfg(target_os = "linux")]
+    linux::set_dismissable(&app, window.label(), on);
+}
+
 /// Linux bar mode: the island opened or closed, so the bar hides or comes back.
 #[tauri::command]
 fn island_open(#[allow(unused_variables)] window: WebviewWindow, #[allow(unused_variables)] open: bool) {
@@ -654,6 +666,7 @@ pub fn run() {
             open_claude_app,
             quit_app,
             island_open,
+            set_dismissable,
             hooks_status,
             hooks_preview,
             hooks_apply,
