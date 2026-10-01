@@ -66,6 +66,8 @@ export function isAgentTask(id: string | undefined | null): boolean {
 /** What the agent is called in a pill or a card header. */
 export function agentLabel(task: AgentTask): string {
   if (task.id === "integration_claude") return State.platform === "linux" ? "Claude Code" : "VS Code";
+  // The session's project name lives in task.name; the pill names the agent.
+  if (task.source === "codex" || task.source === "opencode") return agentTool(task);
   return task.name;
 }
 

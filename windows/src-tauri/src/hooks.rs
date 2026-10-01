@@ -38,7 +38,8 @@ pub const HOOK_EVENTS: &[(&str, u64)] = &[
 /// same event names as Claude Code's settings.json.
 pub const CODEX_EVENTS: &[(&str, u64)] = &[
     ("SessionStart", 10),
-    ("SessionEnd", 10),
+    // Codex caps SessionEnd hooks at 3 s and warns about anything longer.
+    ("SessionEnd", 3),
     ("UserPromptSubmit", 10),
     ("PreToolUse", 10),
     ("PostToolUse", 10),

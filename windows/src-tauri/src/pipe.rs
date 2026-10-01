@@ -194,8 +194,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + HangUp>(app: AppHandle, mut 
         .unwrap_or_default()
         .to_string();
 
+    // Claude Code's events carry no agent from hooks written before --agent.
+    let agent = payload.get("agent").and_then(Value::as_str).unwrap_or("claude").to_string();
+
     if event != "PermissionRequest" {
-        log::line(format!("hook {event}"));
+        log::line(format!("hook {agent} {event}"));
         crate::island::emit_islands(&app, "hook", payload);
         pipe.hang_up();
         return;
@@ -208,7 +211,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + HangUp>(app: AppHandle, mut 
         pending.0.lock().unwrap().insert(id.clone(), tx);
     }
     payload["request_id"] = json!(id);
-    log::line(format!("hook PermissionRequest id={id}"));
+    log::line(format!("hook {agent} PermissionRequest id={id}"));
     crate::island::emit_islands(&app, "hook", payload);
 
     let decision = wait_for_decision(&id, &mut rx).await;
