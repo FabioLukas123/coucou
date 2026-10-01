@@ -76,8 +76,12 @@ pub fn start(app: AppHandle) {
     crate::github::watch_live(app.clone());
     spawn(app.clone(), "integration_calcom", 8, 300, poll_calcom);
     spawn(app.clone(), "integration_notion", 9, 300, poll_notion);
-    spawn(app.clone(), "integration_codex", 2, 60, poll_codex);
-    spawn(app, "integration_opencode", 4, 120, poll_opencode_go);
+    // The AI usage panel: always on, it needs no pill. Codex is read from
+    // disk; Claude and OpenCode Go ask their services with the logins their
+    // own CLIs keep.
+    spawn_usage(app.clone(), 2, 60, poll_codex);
+    spawn_usage(app.clone(), 4, 120, poll_opencode_go);
+    spawn_usage(app, 6, 120, poll_claude_usage);
 }
 
 /// True when the user has this integration switched on in settings.
@@ -88,6 +92,26 @@ pub(crate) fn enabled(app: &AppHandle, id: &str) -> bool {
             settings.active_integrations.iter().any(|x| x == id)
         })
         .unwrap_or(false)
+}
+
+/// A usage poller: like `spawn`, but not tied to a pill being switched on —
+/// the usage panel shows all three. Paused means paused all the same.
+fn spawn_usage<F, Fut>(app: AppHandle, delay_secs: u64, every_secs: u64, poll: F)
+where
+    F: Fn(AppHandle) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        let mut ticker = tokio::time::interval(Duration::from_secs(every_secs));
+        loop {
+            ticker.tick().await;
+            if PAUSED.load(Ordering::Relaxed) {
+                continue;
+            }
+            poll(app.clone()).await;
+        }
+    });
 }
 
 fn spawn<F, Fut>(app: AppHandle, id: &'static str, delay_secs: u64, every_secs: u64, poll: F)
@@ -123,6 +147,7 @@ pub async fn poll_once(app: AppHandle, id: &str) {
         "integration_notion" => poll_notion(app).await,
         "integration_calcom" => poll_calcom(app).await,
         "integration_codex" => poll_codex(app).await,
+        "usage_claude" => poll_claude_usage(app).await,
         "integration_opencode" => poll_opencode_go(app).await,
         _ => {}
     }
@@ -832,6 +857,64 @@ async fn poll_opencode_go(app: AppHandle) {
     emit(&app, IntegrationUpdate {
         id: "integration_opencode",
         data: json.get("usage").cloned().unwrap_or(json!({})),
+        error: None,
+        event: None,
+    });
+}
+
+// ── Claude (subscription usage) ───────────────────────────────────────────────
+
+/// The Claude plan's 5-hour and weekly usage, asked with the login Claude Code
+/// keeps (~/.claude/.credentials.json). Read only: Claude Code renews that
+/// login itself whenever it runs.
+async fn poll_claude_usage(app: AppHandle) {
+    let fail = |app: &AppHandle, msg: &str| {
+        emit(app, IntegrationUpdate { id: "usage_claude", data: json!({}), error: Some(msg.into()), event: None });
+    };
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+    let creds = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"))
+        .join(".credentials.json");
+    let Some(oauth) = std::fs::read(&creds)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.get("claudeAiOauth").cloned())
+    else {
+        return fail(&app, "Log in to Claude Code");
+    };
+    let token = oauth.get("accessToken").and_then(Value::as_str).unwrap_or_default().to_string();
+    let plan = oauth.get("subscriptionType").and_then(Value::as_str).unwrap_or("").to_string();
+    let expires_ms = oauth.get("expiresAt").and_then(Value::as_u64).unwrap_or(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if token.is_empty() || (expires_ms > 0 && expires_ms < now_ms) {
+        return fail(&app, "Open Claude Code to refresh its login");
+    }
+
+    let response = client()
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .bearer_auth(&token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("User-Agent", "Coucou")
+        .send()
+        .await;
+    let Ok(response) = response else { return };
+    if !response.status().is_success() {
+        return fail(&app, &status_error(response.status().as_u16(), "Open Claude Code to refresh its login"));
+    }
+    let v: Value = response.json().await.unwrap_or(json!({}));
+    let window = |k: &str| {
+        json!({
+            "percent": v.pointer(&format!("/{k}/utilization")).and_then(Value::as_f64).unwrap_or(0.0),
+            "resetsAt": v.pointer(&format!("/{k}/resets_at")).and_then(Value::as_str).unwrap_or(""),
+        })
+    };
+    emit(&app, IntegrationUpdate {
+        id: "usage_claude",
+        data: json!({ "plan": plan, "fiveHour": window("five_hour"), "week": window("seven_day") }),
         error: None,
         event: None,
     });

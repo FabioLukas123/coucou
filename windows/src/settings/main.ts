@@ -455,10 +455,6 @@ interface IntegrationSetup {
 }
 
 const INTEGRATIONS: IntegrationDef[] = [
-  { id: "integration_codex", name: "Codex", color: "#10A37F", fields: [],
-    note: "Usage limits from your Codex sessions. No key needed." },
-  { id: "integration_opencode", name: "OpenCode", color: "#FAB283", fields: [],
-    note: "Usage from the Go key OpenCode already has. No key needed." },
   { id: "integration_stripe", name: "Stripe", color: "#0570DE",
     fields: [{ key: "stripe-api-key", label: "Secret key", placeholder: "sk_live_…", secret: true }] },
   { id: "integration_github", name: "GitHub", color: "#F4505E",

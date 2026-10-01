@@ -36,7 +36,8 @@ impl Default for Settings {
             sound_volume: 0.12,
             auto_close_interval: 15.0,
             absence_interval: 180.0,
-            // Linux has the coding agents' pills where Windows has Resend and n8n.
+            // Linux shows the coding agents' usage in its own panel, and their
+            // pills only while a session is going.
             active_integrations: if cfg!(windows) {
                 vec![
                     "integration_resend".into(),
@@ -45,12 +46,7 @@ impl Default for Settings {
                     "integration_github".into(),
                 ]
             } else {
-                vec![
-                    "integration_codex".into(),
-                    "integration_opencode".into(),
-                    "integration_vercel".into(),
-                    "integration_github".into(),
-                ]
+                vec!["integration_vercel".into(), "integration_github".into()]
             },
             // Linux puts an island on every display; Windows keeps one.
             screen: if cfg!(windows) { "primary" } else { "all" }.into(),

@@ -4048,3 +4048,95 @@ button.gh-block:hover {
   color: #c5c8cd;
   font-variant-numeric: tabular-nums;
 }
+
+/* ── AI usage panel ──────────────────────────────────────────────────────── */
+.use-cols {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  gap: 8px;
+  padding: 12px 12px 12px 92px;
+}
+
+.use-col {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px 11px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.use-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.use-name {
+  font: 600 12px var(--font);
+  color: var(--ink);
+}
+
+.use-plan {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.07);
+  font: 600 9.5px var(--font);
+  color: #9aa0a8;
+}
+
+.use-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.use-row {
+  display: grid;
+  grid-template-columns: 34px 1fr 30px 30px;
+  align-items: center;
+  gap: 6px;
+}
+
+.use-label {
+  font: 500 10.5px var(--font);
+  color: var(--dim-3);
+}
+
+.use-track {
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.use-track i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.4s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+
+.use-pct {
+  text-align: right;
+  font: 600 11px var(--font);
+  color: #c5c8cd;
+  font-variant-numeric: tabular-nums;
+}
+
+.use-reset {
+  text-align: right;
+  font: 500 9.5px var(--font);
+  color: var(--dim-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.use-note {
+  font: 400 11px var(--font);
+  color: var(--dim-3);
+  line-height: 1.35;
+}
