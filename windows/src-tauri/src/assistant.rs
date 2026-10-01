@@ -311,7 +311,7 @@ async fn opencode(prompt: &str, resume: Option<&str>, context: Option<&ChatConte
 }
 
 /// The OpenCode Go key, as OpenCode stored it.
-fn go_key() -> Option<String> {
+pub fn go_key() -> Option<String> {
     let base = match std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
         Some(p) if p.is_absolute() => p,
         _ => PathBuf::from(std::env::var_os("HOME")?).join(".local/share"),

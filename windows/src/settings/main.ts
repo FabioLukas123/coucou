@@ -283,13 +283,19 @@ interface IntegrationDef {
   color: string;
   /** Credential Manager keys, in the order they are shown. */
   fields: { key: string; label: string; placeholder: string; secret: boolean }[];
+  /** Shown instead of fields for the pills that use another app's login. */
+  note?: string;
 }
 
 const INTEGRATIONS: IntegrationDef[] = [
+  { id: "integration_codex", name: "Codex", color: "#10A37F", fields: [],
+    note: "Usage limits from your Codex sessions. No key needed." },
+  { id: "integration_opencode", name: "OpenCode Go", color: "#FAB283", fields: [],
+    note: "Usage from the Go key OpenCode already has. No key needed." },
   { id: "integration_stripe", name: "Stripe", color: "#0570DE",
     fields: [{ key: "stripe-api-key", label: "Secret key", placeholder: "sk_live_…", secret: true }] },
   { id: "integration_github", name: "GitHub", color: "#F4505E",
-    fields: [{ key: "github-token", label: "Token", placeholder: "ghp_…", secret: true }] },
+    fields: [{ key: "github-token", label: "Token", placeholder: "ghp_… (or your gh CLI login)", secret: true }] },
   { id: "integration_vercel", name: "Vercel", color: "#7C5CFF",
     fields: [{ key: "vercel-token", label: "Token", placeholder: "…", secret: true }] },
   { id: "integration_n8n", name: "n8n", color: "#F29B38",
@@ -363,6 +369,7 @@ function integrationsSection(present: Record<string, boolean>): HTMLElement {
       );
     }
 
+    if (def.note) rows.append(h("div", { class: "hint", style: "padding-top:5px", text: def.note }));
     list.append(
       h("div", { style: "display:flex;gap:12px;align-items:flex-start" },
         h("div", { style: "display:flex;align-items:center;gap:8px;min-width:132px;padding-top:4px" },

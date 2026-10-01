@@ -36,12 +36,22 @@ impl Default for Settings {
             sound_volume: 0.12,
             auto_close_interval: 15.0,
             absence_interval: 180.0,
-            active_integrations: vec![
-                "integration_resend".into(),
-                "integration_n8n".into(),
-                "integration_vercel".into(),
-                "integration_github".into(),
-            ],
+            // Linux has the coding agents' pills where Windows has Resend and n8n.
+            active_integrations: if cfg!(windows) {
+                vec![
+                    "integration_resend".into(),
+                    "integration_n8n".into(),
+                    "integration_vercel".into(),
+                    "integration_github".into(),
+                ]
+            } else {
+                vec![
+                    "integration_codex".into(),
+                    "integration_opencode".into(),
+                    "integration_vercel".into(),
+                    "integration_github".into(),
+                ]
+            },
             // Linux puts an island on every display; Windows keeps one.
             screen: if cfg!(windows) { "primary" } else { "all" }.into(),
             autostart: false,

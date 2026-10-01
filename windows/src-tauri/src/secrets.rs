@@ -48,5 +48,23 @@ pub fn clear(key: &str) -> Result<(), String> {
 }
 
 pub fn present(key: &str) -> bool {
-    get(key).is_some()
+    get(key).is_some() || (key == "github-token" && gh_cli_token().is_some())
+}
+
+/// The GitHub token to use: the one saved in Coucou, or else the login the
+/// GitHub CLI already has (`gh auth token`). Nothing is copied anywhere — the
+/// CLI is asked each time.
+pub fn github_token() -> Option<String> {
+    get("github-token").or_else(gh_cli_token)
+}
+
+fn gh_cli_token() -> Option<String> {
+    let out = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let token = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !token.is_empty()).then_some(token)
 }

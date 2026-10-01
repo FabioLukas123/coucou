@@ -32,6 +32,11 @@ export async function refreshConfigured() {
     const info = State.integrations[id] ?? { data: {}, error: null, loaded: false, configured: false };
     State.integrations[id] = { ...info, configured: present };
   }
+  // Codex and OpenCode Go need no key here: their own logins are used.
+  for (const id of ["integration_codex", "integration_opencode"]) {
+    const info = State.integrations[id] ?? { data: {}, error: null, loaded: false, configured: false };
+    State.integrations[id] = { ...info, configured: true };
+  }
   const hooks = State.settings.hooksInstalled;
   const claude = State.integrations.integration_claude ?? {
     data: {}, error: null, loaded: false, configured: false,

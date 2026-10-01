@@ -882,7 +882,9 @@ export class Island {
     if (!ctx) return;
 
     const focus = State.focusTask;
-    this.engine.bodyColor = focus?.isIntegration ? hexToRGB(focus.color) : null;
+    // In the bar Mochi is always the white one; colours are for the open island.
+    const inBar = this.bar != null && State.mode !== "expanded";
+    this.engine.bodyColor = focus?.isIntegration && !inBar ? hexToRGB(focus.color) : null;
     this.engine.particleOverhang = BOT_OVERHANG;
     this.engine.lookX = this.lookX();
     this.engine.lookY = this.lookY();

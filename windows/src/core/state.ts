@@ -67,7 +67,8 @@ export function isAgentTask(id: string | undefined | null): boolean {
 export function agentLabel(task: AgentTask): string {
   if (task.id === "integration_claude") return State.platform === "linux" ? "Claude Code" : "VS Code";
   // The session's project name lives in task.name; the pill names the agent.
-  if (task.source === "codex" || task.source === "opencode") return agentTool(task);
+  if (task.source === "codex") return "Codex";
+  if (task.source === "opencode") return "OpenCode Go";
   return task.name;
 }
 
@@ -93,7 +94,7 @@ export const INTEGRATION_AGENTS: AgentTask[] = [
   // Coding agents other than Claude Code. They only get a pill while they have
   // a session going — see AppState.ensureAgent.
   task("integration_codex", "Codex", "#10A37F", "codex"),
-  task("integration_opencode", "OpenCode", "#FAB283", "opencode"),
+  task("integration_opencode", "OpenCode Go", "#FAB283", "opencode"),
   task("integration_resend", "Resend", "#22C55E", "n8n"),
   task("integration_n8n", "n8n", "#F29B38", "n8n"),
   task("integration_vercel", "Vercel", "#7C5CFF", "n8n"),
@@ -104,6 +105,7 @@ export const INTEGRATION_AGENTS: AgentTask[] = [
 ];
 
 export const TOGGLEABLE_INTEGRATION_IDS = [
+  "integration_codex", "integration_opencode",
   "integration_resend", "integration_n8n", "integration_vercel", "integration_github",
   "integration_notion", "integration_calcom", "integration_stripe",
 ];

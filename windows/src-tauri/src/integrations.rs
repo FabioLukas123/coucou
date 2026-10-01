@@ -67,7 +67,9 @@ pub fn start(app: AppHandle) {
     spawn(app.clone(), "integration_resend", 6, 60, poll_resend);
     spawn(app.clone(), "integration_github", 7, 300, poll_github);
     spawn(app.clone(), "integration_calcom", 8, 300, poll_calcom);
-    spawn(app, "integration_notion", 9, 300, poll_notion);
+    spawn(app.clone(), "integration_notion", 9, 300, poll_notion);
+    spawn(app.clone(), "integration_codex", 2, 60, poll_codex);
+    spawn(app, "integration_opencode", 4, 120, poll_opencode_go);
 }
 
 /// True when the user has this integration switched on in settings.
@@ -112,6 +114,8 @@ pub async fn poll_once(app: AppHandle, id: &str) {
         "integration_resend" => poll_resend(app).await,
         "integration_notion" => poll_notion(app).await,
         "integration_calcom" => poll_calcom(app).await,
+        "integration_codex" => poll_codex(app).await,
+        "integration_opencode" => poll_opencode_go(app).await,
         _ => {}
     }
 }
@@ -264,7 +268,7 @@ async fn poll_stripe(app: AppHandle) {
 // ── GitHub ────────────────────────────────────────────────────────────────────
 
 async fn poll_github(app: AppHandle) {
-    let Some(token) = secrets::get("github-token") else { return };
+    let Some(token) = secrets::github_token() else { return };
     let http = client();
 
     let user = http
@@ -761,4 +765,125 @@ fn fmt_value(v: &Value) -> String {
         Value::Object(_) => "{…}".into(),
         other => other.to_string(),
     }
+}
+
+// ── Codex ─────────────────────────────────────────────────────────────────────
+
+/// Codex's usage limits, read from its own session logs: every turn records
+/// the 5-hour and weekly windows. Nothing leaves the machine.
+async fn poll_codex(app: AppHandle) {
+    let limits = tokio::task::spawn_blocking(codex_rate_limits).await.ok().flatten();
+    let Some(limits) = limits else {
+        emit(&app, IntegrationUpdate {
+            id: "integration_codex",
+            data: json!({}),
+            error: Some("No Codex session yet".into()),
+            event: None,
+        });
+        return;
+    };
+    let window = |w: &Value| {
+        json!({
+            "percent": w.get("used_percent").and_then(Value::as_f64).unwrap_or(0.0),
+            "minutes": w.get("window_minutes").and_then(Value::as_i64).unwrap_or(0),
+            "resetsAt": w.get("resets_at").and_then(Value::as_i64).unwrap_or(0),
+        })
+    };
+    emit(&app, IntegrationUpdate {
+        id: "integration_codex",
+        data: json!({
+            "primary": window(&limits["primary"]),
+            "secondary": window(&limits["secondary"]),
+        }),
+        error: None,
+        event: None,
+    });
+}
+
+/// The newest `rate_limits` in the newest Codex session logs.
+fn codex_rate_limits() -> Option<Value> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    let root = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"))
+        .join("sessions");
+    // sessions/YYYY/MM/DD/rollout-*.jsonl — walk the newest days first.
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    let newest = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        let mut v: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        v.sort();
+        v.reverse();
+        v
+    };
+    'outer: for year in newest(&root).into_iter().take(2) {
+        for month in newest(&year).into_iter().take(2) {
+            for day in newest(&month).into_iter().take(3) {
+                for f in newest(&day) {
+                    if let Ok(m) = std::fs::metadata(&f).and_then(|m| m.modified()) {
+                        files.push((m, f));
+                    }
+                }
+                if files.len() >= 12 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, f) in files.into_iter().take(12) {
+        let Ok(text) = std::fs::read_to_string(&f) else { continue };
+        for line in text.lines().rev() {
+            if !line.contains("\"rate_limits\"") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let found = v
+                .pointer("/payload/rate_limits")
+                .or_else(|| v.pointer("/payload/info/rate_limits"))
+                .or_else(|| v.get("rate_limits"))
+                .filter(|r| r.get("primary").is_some());
+            if let Some(r) = found {
+                return Some(r.clone());
+            }
+        }
+    }
+    None
+}
+
+// ── OpenCode Go ───────────────────────────────────────────────────────────────
+
+/// OpenCode Go's usage windows, with the key OpenCode itself stored.
+async fn poll_opencode_go(app: AppHandle) {
+    let Some(key) = crate::assistant::go_key() else {
+        emit(&app, IntegrationUpdate {
+            id: "integration_opencode",
+            data: json!({}),
+            error: Some("Log in to OpenCode Go in OpenCode".into()),
+            event: None,
+        });
+        return;
+    };
+    let response = client()
+        .get("https://opencode.ai/zen/go/v1/usage")
+        .bearer_auth(key)
+        .header("x-opencode-session", "coucou-usage")
+        .send()
+        .await;
+    let Ok(response) = response else { return };
+    if !response.status().is_success() {
+        emit(&app, IntegrationUpdate {
+            id: "integration_opencode",
+            data: json!({}),
+            error: Some(status_error(response.status().as_u16(), "The Go key was refused")),
+            event: None,
+        });
+        return;
+    }
+    let json: Value = response.json().await.unwrap_or(json!({}));
+    emit(&app, IntegrationUpdate {
+        id: "integration_opencode",
+        data: json.get("usage").cloned().unwrap_or(json!({})),
+        error: None,
+        event: None,
+    });
 }

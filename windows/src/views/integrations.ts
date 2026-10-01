@@ -382,10 +382,62 @@ export interface IntegrationCardHooks {
 }
 
 /** True when this integration has data worth showing instead of the idle card. */
+// ── Codex / OpenCode Go usage ─────────────────────────────────────────────────
+
+/** "in 2h 10m", "in 3d" — how far away a reset is. */
+function resetsIn(at: number): string {
+  const s = Math.max(0, at - Date.now() / 1000);
+  if (s < 3600) return `in ${Math.round(s / 60)}m`;
+  if (s < 86400) return `in ${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m`;
+  return `in ${Math.round(s / 86400)}d`;
+}
+
+/** One usage window: label, percent used, when it resets. */
+function usageRow(label: string, percent: number, resetAt: number): HTMLElement {
+  const color = percent >= 90 ? "#F4505E" : percent >= 70 ? "#F5A524" : "#22C55E";
+  return statRow(ICONS.timer, color, `${label} · resets ${resetsIn(resetAt)}`, `${Math.round(percent)}%`);
+}
+
+function codexCard(): HTMLElement {
+  const d = get("integration_codex") as Record<string, Record<string, number>>;
+  const p = d.primary ?? {};
+  const w = d.secondary ?? {};
+  return h(
+    "div",
+    { class: "int-card" },
+    header("#10A37F", "Codex", "Usage"),
+    h(
+      "div",
+      { class: "int-stats" },
+      usageRow("5 hours", p.percent ?? 0, p.resetsAt ?? 0),
+      usageRow("Week", w.percent ?? 0, w.resetsAt ?? 0),
+    ),
+  );
+}
+
+function opencodeGoCard(): HTMLElement {
+  const d = get("integration_opencode") as Record<string, Record<string, unknown>>;
+  const row = (label: string, k: string) => {
+    const win = d[k] ?? {};
+    const at = Date.parse(String(win.resetsAt ?? "")) / 1000 || 0;
+    return usageRow(label, Number(win.percent ?? 0), at);
+  };
+  return h(
+    "div",
+    { class: "int-card" },
+    header("#FAB283", "OpenCode Go", "Usage"),
+    h("div", { class: "int-stats" }, row("5 hours", "rolling"), row("Week", "weekly"), row("Month", "monthly")),
+  );
+}
+
 export function hasIntegrationData(id: string): boolean {
   const info = State.integrations[id];
   if (!info || info.error) return false;
   switch (id) {
+    case "integration_codex":
+      return get(id).primary != null;
+    case "integration_opencode":
+      return get(id).weekly != null;
     case "integration_vercel":
       return arr(id, "deployments").length > 0;
     case "integration_resend":
@@ -416,6 +468,10 @@ export function renderIntegrationCard(task: AgentTask, hooks: IntegrationCardHoo
   if (!hasIntegrationData(task.id)) return idleCard(task, hooks.openSettings);
 
   switch (task.id) {
+    case "integration_codex":
+      return codexCard();
+    case "integration_opencode":
+      return opencodeGoCard();
     case "integration_resend":
       return resendCard();
     case "integration_github":
