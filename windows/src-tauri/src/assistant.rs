@@ -4,8 +4,9 @@
 //
 //   1. Claude Code  — `claude -p`, the user's own default model and login
 //   2. Codex        — `codex exec`, read-only sandbox
-//   3. OpenCode     — `opencode run`, the user's default model
-//   4. OpenCode Go  — the Go API directly, with the key OpenCode stored
+//   3. OpenCode     — `opencode run`, Muse Spark 1.3 free
+//   4. OpenCode Go  — the Go API directly (Muse Spark 1.3), with the key
+//                     OpenCode stored
 //   5. Anthropic    — the original API path, only when a key was saved
 //
 // A conversation sticks to the agent that answered it, resuming the same
@@ -28,10 +29,13 @@ use crate::claude::{self, Chat, ChatContext, ChatReply};
 
 /// Long enough for a web search or two; past that the next agent is tried.
 const TURN_TIMEOUT: Duration = Duration::from_secs(150);
-/// OpenCode Go's OpenAI-compatible endpoint.
-const GO_ENDPOINT: &str = "https://opencode.ai/zen/go/v1/chat/completions";
-/// Go model when COUCOU_GO_MODEL says nothing: fast, and on every Go plan.
-const GO_DEFAULT_MODEL: &str = "deepseek-v4-flash";
+/// OpenCode Go's Responses endpoint — the protocol the Muse models speak.
+const GO_ENDPOINT: &str = "https://opencode.ai/zen/go/v1/responses";
+/// Go model when COUCOU_GO_MODEL says nothing: Muse Spark 1.3. Its free tier
+/// only works from inside OpenCode, so the API gets the Go-plan version.
+const GO_DEFAULT_MODEL: &str = "muse-spark-1.3-contributor";
+/// OpenCode's model for the chat (COUCOU_OPENCODE_MODEL overrides it).
+const OPENCODE_MODEL: &str = "opencode/muse-spark-1.3-contributor-free";
 
 const PERSONA: &str = "You are Mochi, a personal AI assistant living at the top of the user's screen. \
 Help with absolutely anything — research, coding, recommendations, tasks, questions. \
@@ -271,7 +275,8 @@ async fn codex(prompt: &str, resume: Option<&str>) -> Result<(String, String), S
 
 async fn opencode(prompt: &str, resume: Option<&str>, context: Option<&ChatContext>) -> Result<(String, String), String> {
     let mut cmd = Command::new("opencode");
-    cmd.args(["run", "--format", "json"]);
+    let model = std::env::var("COUCOU_OPENCODE_MODEL").unwrap_or_else(|_| OPENCODE_MODEL.into());
+    cmd.args(["run", "--format", "json", "-m", &model]);
     if let Some(id) = resume {
         cmd.args(["--session", id]);
     }
@@ -334,7 +339,7 @@ async fn opencode_go(
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0))
     });
 
-    let mut messages = vec![json!({ "role": "system", "content": PERSONA })];
+    let mut messages: Vec<Value> = Vec::new();
     if resume.is_some() {
         for (role, text) in conv.transcript.lock().unwrap().iter() {
             messages.push(json!({ "role": role, "content": text }));
@@ -358,7 +363,7 @@ async fn opencode_go(
         .post(GO_ENDPOINT)
         .bearer_auth(key)
         .header("x-opencode-session", &session)
-        .json(&json!({ "model": model, "messages": messages }))
+        .json(&json!({ "model": model, "instructions": PERSONA, "input": messages }))
         .send()
         .await
         .map_err(|e| format!("network: {e}"))?;
@@ -368,7 +373,20 @@ async fn opencode_go(
         let msg = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("error");
         return Err(format!("{status} {msg}"));
     }
-    let text = v.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    // Responses API: output[] → message → content[] → output_text.
+    let text = v
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|o| o.get("type").and_then(Value::as_str) == Some("message"))
+        .filter_map(|o| o.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|c| c.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
     if text.is_empty() {
         return Err("empty answer".into());
     }

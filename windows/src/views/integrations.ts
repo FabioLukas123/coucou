@@ -425,7 +425,7 @@ function opencodeGoCard(): HTMLElement {
   return h(
     "div",
     { class: "int-card" },
-    header("#FAB283", "OpenCode Go", "Usage"),
+    header("#FAB283", "OpenCode", "Go usage"),
     h("div", { class: "int-stats" }, row("5 hours", "rolling"), row("Week", "weekly"), row("Month", "monthly")),
   );
 }

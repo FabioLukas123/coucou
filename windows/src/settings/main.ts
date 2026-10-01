@@ -196,7 +196,7 @@ const MODELS: [string, string][] = [
 /** On Linux the chat runs on the coding agents; the key is only a last resort. */
 function noKeyText(): string {
   return platform === "linux"
-    ? "Optional. The chat answers through Claude Code, then Codex, then OpenCode, then OpenCode Go — this key is only the last resort."
+    ? "Optional. The chat answers through Claude Code, then Codex, then OpenCode (Muse Spark 1.3 free), then OpenCode Go — this key is only the last resort."
     : "No key yet — the chat needs one.";
 }
 
@@ -290,7 +290,7 @@ interface IntegrationDef {
 const INTEGRATIONS: IntegrationDef[] = [
   { id: "integration_codex", name: "Codex", color: "#10A37F", fields: [],
     note: "Usage limits from your Codex sessions. No key needed." },
-  { id: "integration_opencode", name: "OpenCode Go", color: "#FAB283", fields: [],
+  { id: "integration_opencode", name: "OpenCode", color: "#FAB283", fields: [],
     note: "Usage from the Go key OpenCode already has. No key needed." },
   { id: "integration_stripe", name: "Stripe", color: "#0570DE",
     fields: [{ key: "stripe-api-key", label: "Secret key", placeholder: "sk_live_…", secret: true }] },
