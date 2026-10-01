@@ -108,6 +108,14 @@ export class Island {
     this.wireFsm();
     this.wireInput();
     this.engine.onDizzy = () => this.handleDizzy();
+    this.fsm.holdOpen = () => State.chatWaiting;
+    // The full auto-close delay counts from the answer, so there is time to read it.
+    State.onChatAnswered = () => {
+      this.fsm.restartHomeCollapse();
+      if (this.homeCollapseAt != null) {
+        this.homeCollapseAt = performance.now() + State.settings.autoCloseInterval * 1000;
+      }
+    };
     this.greeting.onComplete = () => this.fsm.greetComplete();
     State.subscribe(() => {
       this.dirty = true;
@@ -915,7 +923,7 @@ export class Island {
   }
 
   private updateCountdown(nowMs: number) {
-    if (State.mode !== "expanded" || State.isPinned || this.homeCollapseAt == null) {
+    if (State.mode !== "expanded" || State.isPinned || State.chatWaiting || this.homeCollapseAt == null) {
       this.countdown.style.width = "0px";
       return;
     }

@@ -18,6 +18,8 @@ export class IslandStateMachine {
   greetHoverCollapseDelay = 10;
   /** An alert waiting for an answer stays open, even when the mouse leaves. */
   pinned = false;
+  /** Set by the island: true while something must keep it open (a chat answer on its way). */
+  holdOpen: () => boolean = () => false;
 
   private petitHide: number | null = null;
   private homeCollapse: number | null = null;
@@ -112,11 +114,22 @@ export class IslandStateMachine {
     }, this.petitToHiddenDelay * 1000);
   }
 
+  /** Restarts a pending auto-close from now (a chat answer just arrived). */
+  restartHomeCollapse() {
+    if (this.homeCollapse != null) this.scheduleHomeCollapse();
+  }
+
   private scheduleHomeCollapse() {
     this.clear("homeCollapse");
     if (this.pinned) return;
     this.homeCollapse = window.setTimeout(() => {
       this.homeCollapse = null;
+      // A chat answer is on its way: stay open, and give the full delay again
+      // once it has arrived, so there is time to read it.
+      if (this.holdOpen()) {
+        this.scheduleHomeCollapse();
+        return;
+      }
       if (this.state === "home") this.transition("petit");
     }, this.homeToPetitDelay * 1000);
   }

@@ -63,6 +63,7 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     if (!query || sending) return;
     input.value = "";
     sending = true;
+    State.chatWaiting = true;
     Sound.play("send");
 
     State.chatHistory.push({ id: nextId++, role: "user", content: query });
@@ -86,6 +87,8 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
       Sound.play("error");
     } finally {
       sending = false;
+      State.chatWaiting = false;
+      State.onChatAnswered();
       State.notify();
       onHeightChange();
       input.focus();

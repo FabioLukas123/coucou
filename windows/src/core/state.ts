@@ -155,6 +155,11 @@ class AppState {
   tasks: AgentTask[] = [];
   focusId: string | null = null;
 
+  /** A chat message is out and its answer hasn't come back yet. */
+  chatWaiting = false;
+  /** Set by the island: the answer is in, the auto-close starts over. */
+  onChatAnswered: () => void = () => {};
+
   /** "windows" or "linux", from boot. */
   platform: "windows" | "linux" = "windows";
 
