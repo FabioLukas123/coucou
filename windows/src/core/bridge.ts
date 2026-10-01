@@ -37,6 +37,8 @@ export interface BootInfo {
   label: string;
   /** Linux: the top bar the minimised island sits in. */
   bar: Bar | null;
+  /** Linux bar mode: the bar is away, so this island starts out quiet. */
+  suppressed: boolean;
 }
 
 /** A top bar, in logical px from the top of the island's display. */

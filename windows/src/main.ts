@@ -23,6 +23,7 @@ async function main() {
     Sound.silent = boot.label !== "island";
     State.platform = boot.platform;
     island.setBar(boot.bar);
+    island.setSuppressed(boot.suppressed);
   }
   island.applySettings();
   State.loadIntegrationTasks();
@@ -53,6 +54,9 @@ async function main() {
         break;
     }
   });
+
+  // The bar went away (media island, another display's open island) or came back.
+  await onEvent<boolean>("suppressed", (quiet) => island.setSuppressed(quiet));
 
   await onEvent<null>("screen-changed", async () => island.setBar(await Bridge.reposition()));
 

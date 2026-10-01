@@ -95,6 +95,10 @@ pub struct PollGate {
     /// The window is gone; its poll thread should end.
     #[cfg(target_os = "linux")]
     pub closed: AtomicBool,
+    /// Bar mode: the bar is away (hidden by the shell, or by an island open on
+    /// another display), so this island stays invisible and lets the mouse by.
+    #[cfg(target_os = "linux")]
+    pub suppressed: AtomicBool,
 }
 
 impl PollGate {
@@ -113,6 +117,8 @@ impl PollGate {
             bar: Mutex::new(None),
             #[cfg(target_os = "linux")]
             closed: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            suppressed: AtomicBool::new(false),
         }
     }
 
@@ -574,7 +580,9 @@ pub fn spawn_cursor_poll(app: AppHandle, label: String, gate: Arc<PollGate>) {
 #[cfg(target_os = "linux")]
 pub fn apply_input_region(app: &AppHandle, label: &str, gate: &PollGate) {
     let Some(win) = app.get_webview_window(label) else { return };
-    let region = if gate.collapsed.load(Ordering::Relaxed) {
+    let region = if gate.suppressed.load(Ordering::Relaxed) {
+        Some((0.0, 0.0, 0.0, 0.0))
+    } else if gate.collapsed.load(Ordering::Relaxed) {
         None
     } else {
         let r = *gate.rect.lock().unwrap();

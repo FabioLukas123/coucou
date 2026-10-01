@@ -66,6 +66,8 @@ export class Island {
   private bar: Bar | null = null;
   /** What Rust was last told: is this island open over a hidden bar? */
   private toldOpen = false;
+  /** The bar is away (hidden by the shell or another display's island). */
+  private suppressed = false;
   private botCx = new Spring(46);
   private botCy = new Spring(16);
   private botSize = new Spring(10);
@@ -474,6 +476,16 @@ export class Island {
     return bar.top + (bar.height - NOTCH_H) / 2;
   }
 
+  /**
+   * Bar mode: while the bar is away Mochi has nowhere to sit, so the minimised
+   * island disappears (Rust also stops it taking the mouse). An open island —
+   * an approval, say — still shows.
+   */
+  setSuppressed(quiet: boolean) {
+    this.suppressed = quiet;
+    this.applySkin();
+  }
+
   /** The bar this island's display has, from Rust; null for the plain island. */
   setBar(bar: Bar | null) {
     const same = bar?.top === this.bar?.top && bar?.height === this.bar?.height;
@@ -497,6 +509,9 @@ export class Island {
     const inBar = this.bar != null && State.mode !== "expanded";
     this.islandEl.style.background = inBar ? "transparent" : "";
     this.miniGrid.style.display = inBar ? "none" : "";
+    const quiet = this.suppressed && State.mode !== "expanded";
+    this.islandEl.style.visibility = quiet ? "hidden" : "";
+    this.wakeStrip.style.pointerEvents = quiet ? "none" : "";
     const open = this.bar != null && State.mode === "expanded";
     if (open !== this.toldOpen) {
       this.toldOpen = open;

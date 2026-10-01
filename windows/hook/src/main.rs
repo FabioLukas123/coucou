@@ -112,6 +112,11 @@ fn connect() -> Option<std::os::unix::net::UnixStream> {
 }
 
 fn main() {
+    // Set by Coucou on the agents it runs for its own chat: those sessions
+    // are Mochi talking, not coding, and must not show up on the island.
+    if std::env::var_os("COUCOU_HOOK_SKIP").is_some() {
+        std::process::exit(0);
+    }
     let Some((payload, event)) = read_event() else { std::process::exit(0) };
 
     let waits_for_answer = event == "PermissionRequest";

@@ -193,9 +193,16 @@ const MODELS: [string, string][] = [
   ["claude-haiku-4-5", "Claude Haiku 4.5"],
 ];
 
+/** On Linux the chat runs on the coding agents; the key is only a last resort. */
+function noKeyText(): string {
+  return platform === "linux"
+    ? "Optional. The chat answers through Claude Code, then Codex, then OpenCode, then OpenCode Go — this key is only the last resort."
+    : "No key yet — the chat needs one.";
+}
+
 function apiSection(hasKey: boolean): HTMLElement {
   const dot = statusDot(hasKey);
-  const state = h("span", { class: "hint", text: hasKey ? `Key saved in ${keyStore}.` : "No key yet — the chat needs one." });
+  const state = h("span", { class: "hint", text: hasKey ? `Key saved in ${keyStore}.` : noKeyText() });
 
   const field = h("input", {
     type: "password",
@@ -214,7 +221,7 @@ function apiSection(hasKey: boolean): HTMLElement {
     dot.style.background = present ? "#22c55e" : "#f4505e";
     state.textContent = present
       ? `Key saved in ${keyStore}.`
-      : "No key yet — the chat needs one.";
+      : noKeyText();
     field.placeholder = present ? "••••••••••••  (stored)" : "sk-ant-...";
     clearBtn.style.display = present ? "" : "none";
   }

@@ -32,6 +32,8 @@ function toolInput(args) {
 
 /** Hands one event to coucou-hook. `wait` reads its answer back. */
 async function relay(event, body, wait = false) {
+  // Coucou's own chat runs OpenCode too; those sessions stay off the island.
+  if (process.env.COUCOU_HOOK_SKIP) return null;
   try {
     const proc = Bun.spawn([HOOK, "--agent", "opencode", event], {
       stdin: "pipe",

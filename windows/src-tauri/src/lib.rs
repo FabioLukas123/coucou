@@ -1,5 +1,6 @@
 // Coucou for Windows and Linux — app wiring and the commands the island calls.
 
+mod assistant;
 mod claude;
 mod clock;
 mod files;
@@ -74,6 +75,8 @@ pub struct BootInfo {
     label: String,
     /// Linux: the top bar the minimised island sits in, or null.
     bar: serde_json::Value,
+    /// Linux bar mode: the bar is away, so this island starts out quiet.
+    suppressed: bool,
 }
 
 /// The poll gate of the island window `label`. Windows has a single island.
@@ -123,6 +126,10 @@ fn boot(app: AppHandle, window: WebviewWindow, shared: State<Shared>) -> BootInf
         #[cfg(not(target_os = "linux"))]
         dom_cursor: false,
         bar: bar_of(&gate_of(&app, &shared, window.label())),
+        #[cfg(target_os = "linux")]
+        suppressed: gate_of(&app, &shared, window.label()).suppressed.load(Ordering::Relaxed),
+        #[cfg(not(target_os = "linux"))]
+        suppressed: false,
         label: window.label().to_string(),
     }
 }
@@ -163,6 +170,9 @@ fn set_collapsed(app: AppHandle, window: WebviewWindow, shared: State<Shared>, c
     let label = window.label();
     let gate = gate_of(&app, &shared, label);
     gate.collapsed.store(collapsed, Ordering::Relaxed);
+    if collapsed {
+        island::set_activating(&window, false);
+    }
     place_island(&app, &shared, label, collapsed);
     // The wake strip must always take the mouse, and a resize invalidates the flag.
     #[cfg(windows)]
@@ -298,7 +308,13 @@ fn quit_app(app: AppHandle) {
 #[tauri::command]
 fn island_open(#[allow(unused_variables)] window: WebviewWindow, #[allow(unused_variables)] open: bool) {
     #[cfg(target_os = "linux")]
-    linux::island_open(window.label(), open);
+    {
+        // A closed island never keeps the keyboard.
+        if !open {
+            island::set_activating(&window, false);
+        }
+        linux::island_open(window.label(), open);
+    }
 }
 
 /// Tray → Pause. Paused means paused: the pollers stop talking to the network,
@@ -381,16 +397,19 @@ fn approval_decline(app: AppHandle, window: WebviewWindow, request_id: String) {
 async fn chat_send(
     shared: State<'_, Shared>,
     chat: State<'_, Chat>,
+    conv: State<'_, assistant::Conversation>,
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
     let model = shared.settings.lock().unwrap().model.clone();
-    claude::send(&chat, &model, query, context).await
+    // Claude Code, Codex, OpenCode, OpenCode Go — then the API key, if any.
+    assistant::send(&conv, &chat, &model, query, context).await
 }
 
 #[tauri::command]
-fn chat_reset(chat: State<Chat>) {
+fn chat_reset(chat: State<Chat>, conv: State<assistant::Conversation>) {
     chat.reset();
+    conv.reset();
 }
 
 /// Copies a dropped file into the inbox and reports its name back.
@@ -533,6 +552,7 @@ pub fn run() {
         .manage(Pending::default())
         .manage(islands_state())
         .manage(Chat::default())
+        .manage(assistant::Conversation::default())
         .invoke_handler(tauri::generate_handler![
             boot,
             save_settings,
@@ -592,6 +612,8 @@ pub fn run() {
                 // The other displays get their islands now, and whenever they change.
                 islands::sync(&handle);
                 islands::watch_displays(&handle);
+                linux::init_bar_control(&handle);
+                linux::refresh_suppression();
             }
 
             log::line(format!("--- Coucou {} started ---", env!("CARGO_PKG_VERSION")));
@@ -606,7 +628,7 @@ pub fn run() {
             // Never leave the bar hidden behind us.
             #[cfg(target_os = "linux")]
             if let tauri::RunEvent::Exit = event {
-                linux::set_bar_hidden(false);
+                linux::restore_bar_now();
             }
             let _ = event;
         });

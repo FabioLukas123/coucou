@@ -140,6 +140,8 @@ pub fn sync(app: &AppHandle) {
     }
     // The pages re-read their bar and display.
     island::emit_islands(app, "screen-changed", ());
+    // A new island learns at once whether the bar is away.
+    crate::linux::refresh_suppression();
 }
 
 /// A second island window, identical to the one in tauri.linux.conf.json.

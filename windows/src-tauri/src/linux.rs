@@ -160,8 +160,12 @@ pub fn prepare_island(win: &WebviewWindow) {
 pub fn set_activating(win: &WebviewWindow, activating: bool) {
     let Ok(gtk_win) = win.gtk_window() else { return };
     match surface() {
+        // OnDemand never hands a layer surface the keyboard on Hyprland, so
+        // the chat takes it outright while it is open. Rust gives it back
+        // whenever the island closes or collapses (lib.rs), so it can never
+        // stay stuck on an island nobody sees.
         Surface::Layer => gtk_win.set_keyboard_mode(if activating {
-            gtk_layer_shell::KeyboardMode::OnDemand
+            gtk_layer_shell::KeyboardMode::Exclusive
         } else {
             gtk_layer_shell::KeyboardMode::None
         }),
@@ -353,8 +357,10 @@ pub fn bar_for(m: &Monitor) -> Option<Bar> {
             last.insert(key, bar.clone());
             Some(bar)
         }
-        // We hid it ourselves: it is still that island's bar.
-        None if BAR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) => last.get(&key).cloned(),
+        // Hidden (by us or by the shell): still that display's bar.
+        None if BAR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) || helper_says_hidden() == Some(true) => {
+            last.get(&key).cloned()
+        }
         None => {
             last.remove(&key);
             None
@@ -413,12 +419,36 @@ fn hyprland_request(what: &str) -> Option<String> {
 }
 
 // ── Hiding the bar while the island is open ──────────────────────────────────
+//
+// Waybar has one remote switch, SIGUSR1, and it is a toggle. Shells that drive
+// Waybar themselves usually wrap it in an idempotent helper that remembers the
+// state (`waybar-visibility show|hide`, state in
+// $XDG_RUNTIME_DIR/azrael-shell/waybar-visibility.state). When that helper is
+// there Coucou goes through it, so the shell's idea of the bar never drifts;
+// otherwise it toggles and keeps count itself.
+//
+// The minimised island lives in the bar, so it follows the bar: when the bar
+// is hidden by something else (a media island, a voice assistant) or by an
+// island open on another display, Mochi on this display goes quiet —
+// invisible, and not taking the mouse.
 
 /// Islands that are open right now. While any is, Waybar is hidden, so the
 /// open island hangs from the top edge exactly like the original.
 static OPEN_ISLANDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-/// Whether we hid Waybar and owe it a toggle back.
+/// Whether we hid Waybar and owe it a "show".
 static BAR_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+/// Starts following the bar's visibility. Call once, at setup.
+pub fn init_bar_control(app: &tauri::AppHandle) {
+    let _ = APP.set(app.clone());
+    if let Some(state) = helper_state_file() {
+        if let Some(dir) = state.parent() {
+            let _ = std::fs::create_dir_all(dir);
+            watch_dir(dir.to_path_buf());
+        }
+    }
+}
 
 /// Island `label` opened (`true`) or closed (`false`).
 pub fn island_open(label: &str, open: bool) {
@@ -430,20 +460,140 @@ pub fn island_open(label: &str, open: bool) {
         }
         !list.is_empty()
     };
-    crate::log::line(format!("{label} {} — bar hidden: {any_open}", if open { "open" } else { "closed" }));
     set_bar_hidden(any_open);
+    refresh_suppression();
 }
 
-/// Hides or shows Waybar. Its only remote switch is SIGUSR1, a toggle, so we
-/// keep track of what we did and only ever undo our own toggle.
+/// The shell's Waybar helper, if it has one.
+fn helper() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("COUCOU_WAYBAR_HELPER") {
+        return Some(p.into());
+    }
+    let p = std::path::PathBuf::from(std::env::var_os("HOME")?).join(".local/bin/waybar-visibility");
+    p.exists().then_some(p)
+}
+
+fn helper_state_file() -> Option<std::path::PathBuf> {
+    helper()?;
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
+    Some(std::path::PathBuf::from(runtime).join("azrael-shell/waybar-visibility.state"))
+}
+
+/// What the helper says: hidden, visible, or nothing known.
+fn helper_says_hidden() -> Option<bool> {
+    let text = std::fs::read_to_string(helper_state_file()?).ok()?;
+    match text.trim() {
+        "hidden" => Some(true),
+        "visible" => Some(false),
+        _ => None,
+    }
+}
+
+/// Hidden by someone other than us.
+fn hidden_by_others() -> bool {
+    !BAR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) && helper_says_hidden() == Some(true)
+}
+
+/// Hides or shows Waybar, and only ever undoes our own hiding.
 pub fn set_bar_hidden(hide: bool) {
     use std::sync::atomic::Ordering;
     if BAR_HIDDEN.load(Ordering::Relaxed) == hide {
         return;
     }
-    if signal_waybar() {
-        BAR_HIDDEN.store(hide, Ordering::Relaxed);
+    if hide && hidden_by_others() {
+        // Already out of the way, and not ours to bring back.
+        return;
     }
+    BAR_HIDDEN.store(hide, Ordering::Relaxed);
+    bar_worker().send(hide).ok();
+}
+
+/// Gives the bar back right now, on the way out.
+pub fn restore_bar_now() {
+    if BAR_HIDDEN.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        apply_bar(false);
+    }
+}
+
+/// One thread applies the requests in order: the helper takes a lock and may
+/// relaunch Waybar, which is no work for the main thread.
+fn bar_worker() -> &'static std::sync::mpsc::Sender<bool> {
+    static TX: OnceLock<std::sync::mpsc::Sender<bool>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        std::thread::spawn(move || {
+            for hide in rx {
+                apply_bar(hide);
+                refresh_suppression();
+            }
+        });
+        tx
+    })
+}
+
+fn apply_bar(hide: bool) {
+    match helper() {
+        Some(h) => {
+            let _ = std::process::Command::new(h)
+                .arg(if hide { "hide" } else { "show" })
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        None => {
+            signal_waybar();
+        }
+    }
+}
+
+/// Tells every island whether it should stay quiet, and cuts its input to
+/// nothing while it does.
+pub fn refresh_suppression() {
+    let Some(app) = APP.get() else { return };
+    use tauri::{Emitter, Manager};
+    let bar_away = BAR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) || hidden_by_others();
+    let open = OPEN_ISLANDS.lock().unwrap().clone();
+    let gates: Vec<(String, std::sync::Arc<crate::island::PollGate>)> = app
+        .state::<crate::islands::Islands>()
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(l, g)| (l.clone(), g.clone()))
+        .collect();
+    for (label, gate) in gates {
+        let quiet = bar_away && !open.contains(&label);
+        let was = gate.suppressed.swap(quiet, std::sync::atomic::Ordering::Relaxed);
+        if was != quiet {
+            let _ = app.emit_to(label.as_str(), "suppressed", quiet);
+            crate::island::apply_input_region(app, &label, &gate);
+        }
+    }
+}
+
+/// inotify on the helper's state directory: zero cost until the bar changes.
+fn watch_dir(dir: std::path::PathBuf) {
+    std::thread::spawn(move || unsafe {
+        let fd = libc::inotify_init1(libc::IN_CLOEXEC);
+        if fd < 0 {
+            return;
+        }
+        let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else { return };
+        let mask = libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_MODIFY;
+        if libc::inotify_add_watch(fd, path.as_ptr(), mask) < 0 {
+            libc::close(fd);
+            return;
+        }
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+            if n <= 0 {
+                break;
+            }
+            refresh_suppression();
+        }
+    });
 }
 
 /// SIGTERM, SIGINT and SIGHUP end the app without Tauri's exit event, which is
@@ -462,7 +612,7 @@ fn give_bar_back_on_signals() {
         std::thread::spawn(move || {
             let mut sig = 0;
             libc::sigwait(&set, &mut sig);
-            set_bar_hidden(false);
+            restore_bar_now();
             std::process::exit(128 + sig);
         });
     }
