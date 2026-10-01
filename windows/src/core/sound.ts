@@ -84,8 +84,14 @@ class SoundEngine {
     this.enabled = on;
   }
 
+  /**
+   * Linux, one island per display: only the primary island makes a sound, or
+   * every chime would play once per screen.
+   */
+  silent = false;
+
   play(name: SoundName | string) {
-    if (!this.enabled) return;
+    if (!this.enabled || this.silent) return;
     const ctx = this.ctx;
     const master = this.master;
     const buf = this.buffers.get(name);

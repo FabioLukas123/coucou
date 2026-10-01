@@ -73,6 +73,8 @@ body {
   border-radius: 0 0 14px 14px;
   overflow: visible;
   will-change: width, height, transform;
+  /* Linux bar mode fades the black in as the island opens out of the bar. */
+  transition: background-color 0.22s ease;
 }
 
 #island-clip {

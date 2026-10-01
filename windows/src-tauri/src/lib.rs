@@ -7,6 +7,8 @@ mod hooks;
 mod integrations;
 mod island;
 #[cfg(target_os = "linux")]
+mod islands;
+#[cfg(target_os = "linux")]
 mod linux;
 mod log;
 mod pipe;
@@ -23,7 +25,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 
 use claude::{Chat, ChatContext, ChatReply};
@@ -68,10 +70,44 @@ pub struct BootInfo {
     /// No global cursor to read (most Wayland compositors): the island follows
     /// the webview's own mouse events instead of the `cursor` event.
     dom_cursor: bool,
+    /// This window's label. Only the primary island (`island`) plays sounds.
+    label: String,
+    /// Linux: the top bar the minimised island sits in, or null.
+    bar: serde_json::Value,
+}
+
+/// The poll gate of the island window `label`. Windows has a single island.
+fn gate_of(app: &AppHandle, shared: &Shared, label: &str) -> Arc<PollGate> {
+    #[cfg(target_os = "linux")]
+    if let Some(gate) = islands::gate(app, label) {
+        return gate;
+    }
+    let _ = (app, label);
+    shared.gate.clone()
+}
+
+/// The bar island `label` was last placed against, as JSON for the page.
+fn bar_of(#[allow(unused_variables)] gate: &PollGate) -> serde_json::Value {
+    #[cfg(target_os = "linux")]
+    return serde_json::to_value(gate.bar.lock().unwrap().clone()).unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    serde_json::Value::Null
+}
+
+/// Places island `label` again (display, size, bar).
+fn place_island(app: &AppHandle, shared: &Shared, label: &str, collapsed: bool) {
+    let pref = shared.settings.lock().unwrap().screen.clone();
+    #[cfg(target_os = "linux")]
+    island::place(app, label, &gate_of(app, shared, label), &pref, collapsed);
+    #[cfg(windows)]
+    {
+        let _ = label;
+        island::apply_geometry(app, &pref, collapsed);
+    }
 }
 
 #[tauri::command]
-fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
+fn boot(app: AppHandle, window: WebviewWindow, shared: State<Shared>) -> BootInfo {
     let mut settings = shared.settings.lock().unwrap().clone();
     // The real state of ~/.claude/settings.json wins over whatever we stored.
     settings.hooks_installed = hooks::status().installed;
@@ -86,6 +122,8 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
         dom_cursor: linux::dom_cursor(),
         #[cfg(not(target_os = "linux"))]
         dom_cursor: false,
+        bar: bar_of(&gate_of(&app, &shared, window.label())),
+        label: window.label().to_string(),
     }
 }
 
@@ -109,8 +147,10 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
         }
     }
     if screen_changed {
-        let collapsed = shared.gate.collapsed.load(Ordering::Relaxed);
-        island::apply_geometry(&app, &settings.screen, collapsed);
+        #[cfg(target_os = "linux")]
+        islands::request_sync(&app);
+        #[cfg(windows)]
+        island::apply_geometry(&app, &settings.screen, shared.gate.collapsed.load(Ordering::Relaxed));
     }
     // Keep the other window in step (island ⇄ settings window).
     let _ = app.emit("settings-changed", settings);
@@ -119,49 +159,53 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
 /// Hidden island → shrink the window to the invisible wake strip and park the
 /// cursor poll; anything else → full panel and 60 Hz polling.
 #[tauri::command]
-fn set_collapsed(app: AppHandle, shared: State<Shared>, collapsed: bool) {
-    let pref = shared.settings.lock().unwrap().screen.clone();
-    shared.gate.collapsed.store(collapsed, Ordering::Relaxed);
-    island::apply_geometry(&app, &pref, collapsed);
+fn set_collapsed(app: AppHandle, window: WebviewWindow, shared: State<Shared>, collapsed: bool) {
+    let label = window.label();
+    let gate = gate_of(&app, &shared, label);
+    gate.collapsed.store(collapsed, Ordering::Relaxed);
+    place_island(&app, &shared, label, collapsed);
     // The wake strip must always take the mouse, and a resize invalidates the flag.
     #[cfg(windows)]
     island::set_ignore_cursor(&app, false);
     #[cfg(target_os = "linux")]
-    island::apply_input_region(&app, &shared.gate);
-    shared.gate.forget_ignore_state();
-    shared.gate.set_active(!collapsed);
+    island::apply_input_region(&app, label, &gate);
+    gate.forget_ignore_state();
+    gate.set_active(!collapsed);
 }
 
 /// The front end pushes the island shape; Rust decides click-through from it.
 #[tauri::command]
 fn set_island_rect(
-    #[allow(unused_variables)] app: AppHandle,
+    app: AppHandle,
+    window: WebviewWindow,
     shared: State<Shared>,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
 ) {
-    shared.gate.set_rect(island::IslandRect { x, y, w: width, h: height });
+    let gate = gate_of(&app, &shared, window.label());
+    gate.set_rect(island::IslandRect { x, y, w: width, h: height });
     // Linux has no cursor-driven click-through; the input region follows the shape.
     #[cfg(target_os = "linux")]
-    island::apply_input_region(&app, &shared.gate);
+    island::apply_input_region(&app, window.label(), &gate);
 }
 
 #[tauri::command]
-fn focus_window(app: AppHandle, focused: bool) {
-    let Some(win) = island::window(&app) else { return };
-    island::set_activating(&win, focused);
+fn focus_window(window: WebviewWindow, focused: bool) {
+    island::set_activating(&window, focused);
     if focused {
-        let _ = win.set_focus();
+        let _ = window.set_focus();
     }
 }
 
+/// Places the calling island again and returns the bar it now sits in.
 #[tauri::command]
-fn reposition(app: AppHandle, shared: State<Shared>) {
-    let pref = shared.settings.lock().unwrap().screen.clone();
-    let collapsed = shared.gate.collapsed.load(Ordering::Relaxed);
-    island::apply_geometry(&app, &pref, collapsed);
+fn reposition(app: AppHandle, window: WebviewWindow, shared: State<Shared>) -> serde_json::Value {
+    let label = window.label();
+    let gate = gate_of(&app, &shared, label);
+    place_island(&app, &shared, label, gate.collapsed.load(Ordering::Relaxed));
+    bar_of(&gate)
 }
 
 #[tauri::command]
@@ -250,6 +294,13 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
+/// Linux bar mode: the island opened or closed, so the bar hides or comes back.
+#[tauri::command]
+fn island_open(#[allow(unused_variables)] window: WebviewWindow, #[allow(unused_variables)] open: bool) {
+    #[cfg(target_os = "linux")]
+    linux::island_open(window.label(), open);
+}
+
 /// Tray → Pause. Paused means paused: the pollers stop talking to the network,
 /// not just the island stopping showing things.
 #[tauri::command]
@@ -257,17 +308,18 @@ fn set_paused(paused: bool) {
     integrations::set_paused(paused);
 }
 
-// ── Claude Code hooks ─────────────────────────────────────────────────────────
+// ── Coding agent hooks (Claude Code, Codex, OpenCode) ───────────────────────
 
+/// `agent` is "claude" (the default), "codex" or "opencode".
 #[tauri::command]
-fn hooks_status() -> HookStatus {
-    hooks::status()
+fn hooks_status(agent: Option<String>) -> Result<HookStatus, String> {
+    Ok(hooks::status_for(hooks::Agent::parse(agent.as_deref())?))
 }
 
 /// Returns the diff the user has to look at before anything is written.
 #[tauri::command]
-fn hooks_preview(install: bool) -> Result<HookPreview, String> {
-    hooks::preview(install)
+fn hooks_preview(install: bool, agent: Option<String>) -> Result<HookPreview, String> {
+    hooks::preview_for(hooks::Agent::parse(agent.as_deref())?, install)
 }
 
 /// Only ever called from an explicit click in the settings window.
@@ -277,14 +329,18 @@ fn hooks_apply(
     shared: State<Shared>,
     install: bool,
     fingerprint: String,
+    agent: Option<String>,
 ) -> Result<String, String> {
+    let agent = hooks::Agent::parse(agent.as_deref())?;
     // The fingerprint comes from the preview the user actually looked at, so a
     // settings.json that changed in between is refused rather than overwritten.
-    let backup = hooks::write(install, &fingerprint)?;
+    let backup = hooks::write_for(agent, install, &fingerprint)?;
     let updated = {
         let mut current = shared.settings.lock().unwrap();
-        current.hooks_installed = install;
-        let _ = settings::save(&current);
+        if agent == hooks::Agent::Claude {
+            current.hooks_installed = install;
+            let _ = settings::save(&current);
+        }
         current.clone()
     };
     let _ = app.emit("settings-changed", updated);
@@ -294,21 +350,28 @@ fn hooks_apply(
 #[tauri::command]
 fn approval_decision(app: AppHandle, request_id: String, decision: String) {
     pipe::answer(&app, &request_id, &decision);
+    // Any island can answer; the others drop the card.
+    island::emit_islands(&app, "approval-resolved", request_id);
 }
 
 /// The island has the card on screen, so the long wait for a human may begin.
 /// Until this arrives the relay only waits a few hundred milliseconds, which is
 /// what stops a paused or unresponsive island from freezing Claude Code.
 #[tauri::command]
-fn approval_ack(app: AppHandle, request_id: String) {
-    pipe::acknowledge(&app, &request_id);
+fn approval_ack(app: AppHandle, window: WebviewWindow, request_id: String) {
+    // Every island sees the card; only the primary one speaks for them.
+    if window.label() == island::WINDOW_LABEL {
+        pipe::acknowledge(&app, &request_id);
+    }
 }
 
 /// Nobody can act on this request — the island is paused, or another card is
 /// already up. Claude Code falls back to asking in the terminal immediately.
 #[tauri::command]
-fn approval_decline(app: AppHandle, request_id: String) {
-    pipe::decline(&app, &request_id);
+fn approval_decline(app: AppHandle, window: WebviewWindow, request_id: String) {
+    if window.label() == island::WINDOW_LABEL {
+        pipe::decline(&app, &request_id);
+    }
 }
 
 // ── Chat, files and secrets ───────────────────────────────────────────────────
@@ -445,13 +508,22 @@ pub fn main() {
     run();
 }
 
+#[cfg(target_os = "linux")]
+fn islands_state() -> islands::Islands {
+    islands::Islands::default()
+}
+
+/// Nothing to keep track of with a single island.
+#[cfg(not(target_os = "linux"))]
+fn islands_state() {}
+
 pub fn run() {
     let loaded = settings::load();
     let gate = Arc::new(PollGate::new());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            let _ = app.emit_to(island::WINDOW_LABEL, "tray", "open".to_string());
+            island::emit_islands(app, "tray", "open".to_string());
         }))
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
         .manage(Shared {
@@ -459,6 +531,7 @@ pub fn run() {
             gate: gate.clone(),
         })
         .manage(Pending::default())
+        .manage(islands_state())
         .manage(Chat::default())
         .invoke_handler(tauri::generate_handler![
             boot,
@@ -470,6 +543,7 @@ pub fn run() {
             open_url,
             open_in_vscode,
             quit_app,
+            island_open,
             hooks_status,
             hooks_preview,
             hooks_apply,
@@ -496,12 +570,29 @@ pub fn run() {
 
             if let Some(win) = island::window(&handle) {
                 island::make_non_activating(&win);
+                #[cfg(windows)]
                 island::apply_geometry(&handle, &loaded.screen, false);
+                #[cfg(target_os = "linux")]
+                island::place(&handle, island::WINDOW_LABEL, &gate, &loaded.screen, false);
                 let _ = win.show();
             }
             gate.collapsed.store(false, Ordering::Relaxed);
             gate.set_active(true);
+            #[cfg(windows)]
             island::spawn_cursor_poll(handle.clone(), gate.clone());
+            #[cfg(target_os = "linux")]
+            {
+                handle
+                    .state::<islands::Islands>()
+                    .0
+                    .lock()
+                    .unwrap()
+                    .insert(island::WINDOW_LABEL.to_string(), gate.clone());
+                island::spawn_cursor_poll(handle.clone(), island::WINDOW_LABEL.to_string(), gate.clone());
+                // The other displays get their islands now, and whenever they change.
+                islands::sync(&handle);
+                islands::watch_displays(&handle);
+            }
 
             log::line(format!("--- Coucou {} started ---", env!("CARGO_PKG_VERSION")));
             hooks::ensure_hook_exe(&handle);
@@ -509,6 +600,14 @@ pub fn run() {
             integrations::start(handle.clone());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Coucou");
+        .build(tauri::generate_context!())
+        .expect("error while running Coucou")
+        .run(|_app, event| {
+            // Never leave the bar hidden behind us.
+            #[cfg(target_os = "linux")]
+            if let tauri::RunEvent::Exit = event {
+                linux::set_bar_hidden(false);
+            }
+            let _ = event;
+        });
 }

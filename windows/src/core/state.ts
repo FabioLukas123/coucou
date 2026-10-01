@@ -3,7 +3,7 @@
 import type { BotEmoteName, BotStateName, IslandMode, IslandViewName } from "./layout";
 import type { EyeShape } from "../mochi/engine";
 
-export type AgentSource = "claudeCode" | "n8n";
+export type AgentSource = "claudeCode" | "codex" | "opencode" | "n8n";
 export type PillBadge = "approval" | "finished" | "error";
 
 export interface AgentTask {
@@ -22,6 +22,8 @@ export interface AgentTask {
 }
 
 export interface ApprovalInfo {
+  /** Which agent's pill asked: Claude Code, Codex or OpenCode. */
+  taskId?: string;
   requestId: string;
   sessionId: string;
   tool: string;
@@ -50,6 +52,33 @@ export interface SearchResult {
   note?: string;
 }
 
+/** One pill per coding agent that reports through coucou-hook. */
+export const AGENT_TASK_IDS: Record<string, string> = {
+  claude: "integration_claude",
+  codex: "integration_codex",
+  opencode: "integration_opencode",
+};
+
+export function isAgentTask(id: string | undefined | null): boolean {
+  return id === "integration_claude" || id === "integration_codex" || id === "integration_opencode";
+}
+
+/** What the agent is called in a pill or a card header. */
+export function agentLabel(task: AgentTask): string {
+  if (task.id === "integration_claude") return State.platform === "linux" ? "Claude Code" : "VS Code";
+  return task.name;
+}
+
+/** The tool name shown next to a live session. */
+export function agentTool(task: AgentTask): string {
+  switch (task.source) {
+    case "claudeCode": return "Claude Code";
+    case "codex": return "Codex";
+    case "opencode": return "OpenCode";
+    default: return "n8n";
+  }
+}
+
 const task = (
   id: string, name: string, color: string, source: AgentSource,
 ): AgentTask => ({
@@ -59,6 +88,10 @@ const task = (
 /** AgentTask.integrationAgents — same ids, names and colours as macOS. */
 export const INTEGRATION_AGENTS: AgentTask[] = [
   task("integration_claude", "VS Code", "#F5F6F8", "claudeCode"),
+  // Coding agents other than Claude Code. They only get a pill while they have
+  // a session going — see AppState.ensureAgent.
+  task("integration_codex", "Codex", "#10A37F", "codex"),
+  task("integration_opencode", "OpenCode", "#FAB283", "opencode"),
   task("integration_resend", "Resend", "#22C55E", "n8n"),
   task("integration_n8n", "n8n", "#F29B38", "n8n"),
   task("integration_vercel", "Vercel", "#7C5CFF", "n8n"),
@@ -87,7 +120,8 @@ export interface Settings {
   autoCloseInterval: number;
   absenceInterval: number;
   activeIntegrations: string[];
-  screen: "primary" | "cursor";
+  /** "all" = one island per display (Linux). */
+  screen: "primary" | "cursor" | "all";
   autostart: boolean;
   hooksInstalled: boolean;
   /** Claude model used by the chat. */
@@ -116,6 +150,12 @@ class AppState {
 
   tasks: AgentTask[] = [];
   focusId: string | null = null;
+
+  /** "windows" or "linux", from boot. */
+  platform: "windows" | "linux" = "windows";
+
+  /** Coding agents (other than Claude Code) with a session going. */
+  liveAgents = new Set<string>();
 
   stateOverride: BotStateName | null = null;
 
@@ -203,7 +243,9 @@ class AppState {
   loadIntegrationTasks() {
     for (const proto of INTEGRATION_AGENTS) {
       const shouldLoad =
-        proto.id === "integration_claude" || this.settings.activeIntegrations.includes(proto.id);
+        proto.id === "integration_claude" ||
+        this.liveAgents.has(proto.id) ||
+        this.settings.activeIntegrations.includes(proto.id);
       const idx = this.tasks.findIndex((t) => t.id === proto.id);
       if (shouldLoad && idx < 0) this.tasks.push({ ...proto, steps: [] });
       if (!shouldLoad && idx >= 0) this.tasks.splice(idx, 1);
@@ -213,6 +255,20 @@ class AppState {
     this.tasks.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
     if (!this.focusId) this.focusId = "integration_claude";
     this.notify();
+  }
+
+  /** Gives a coding agent its pill the first time it reports. */
+  ensureAgent(id: string) {
+    if (id === "integration_claude" || this.liveAgents.has(id)) return;
+    this.liveAgents.add(id);
+    this.loadIntegrationTasks();
+  }
+
+  /** Session over: the agent's pill goes away again. */
+  dropAgent(id: string) {
+    if (!this.liveAgents.delete(id)) return;
+    if (this.focusId === id) this.focusId = "integration_claude";
+    this.loadIntegrationTasks();
   }
 
   toggleIntegration(id: string) {

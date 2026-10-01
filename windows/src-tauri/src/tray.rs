@@ -2,9 +2,8 @@
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
-use crate::island::WINDOW_LABEL;
 
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Coucou", true, None::<&str>)?;
@@ -23,7 +22,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
             "quit" => app.exit(0),
             "settings" => crate::show_settings_window(app),
             id => {
-                let _ = app.emit_to(WINDOW_LABEL, "tray", id.to_string());
+                crate::island::emit_islands(app, "tray", id.to_string());
             }
         });
 

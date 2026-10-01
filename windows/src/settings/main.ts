@@ -3,7 +3,7 @@
 // integrations land here too in a later stage.
 
 import "./settings.css";
-import { Bridge, onEvent, type HookStatus } from "../core/bridge";
+import { Bridge, onEvent, type AgentName, type HookStatus } from "../core/bridge";
 import { DEFAULT_SETTINGS, type Settings } from "../core/state";
 import { h, clear } from "../views/dom";
 
@@ -12,6 +12,7 @@ let version = "";
 /** Where keys are kept, in the settings' own words. */
 let keyStore = "the Windows Credential Manager";
 let hookName = "coucou-hook.exe";
+let platform: "windows" | "linux" = "windows";
 
 const root = document.getElementById("settings-root")!;
 
@@ -44,25 +45,33 @@ function renderDiff(text: string): HTMLElement {
   return box;
 }
 
-// ── Claude Code section ───────────────────────────────────────────────────────
+// ── Coding agents: Claude Code, Codex, OpenCode ───────────────────────────────
 
-function claudeSection(status: HookStatus): HTMLElement {
+/** How each agent is named and what file Coucou edits for it. */
+const AGENTS: Record<AgentName, { title: string; file: string; kind: string }> = {
+  claude: { title: "Claude Code", file: "settings.json", kind: "settings.json" },
+  codex: { title: "Codex", file: "hooks.json", kind: "hooks.json" },
+  opencode: { title: "OpenCode", file: "Plugin", kind: "plugin file" },
+};
+
+function agentSection(agent: AgentName, status: HookStatus): HTMLElement {
+  const { title, file, kind } = AGENTS[agent];
   const body = h("div", { style: "display:flex;flex-direction:column;gap:12px" });
   const section = h(
     "section",
     {},
-    h("h2", {}, statusDot(status.installed), h("span", { text: "Claude Code" })),
+    h("h2", {}, statusDot(status.installed), h("span", { text: title })),
     body,
   );
 
   const rebuild = async () => {
-    const fresh = await Bridge.hooksStatus();
+    const fresh = await Bridge.hooksStatus(agent);
     if (fresh) Object.assign(status, fresh);
     clear(body);
     draw();
     const head = section.querySelector("h2")!;
     clear(head);
-    head.append(statusDot(status.installed), h("span", { text: "Claude Code" }));
+    head.append(statusDot(status.installed), h("span", { text: title }));
   };
 
   function draw() {
@@ -70,11 +79,11 @@ function claudeSection(status: HookStatus): HTMLElement {
       h("div", {
         class: "hint",
         text: status.installed
-          ? "Coucou is hooked into your Claude Code sessions. Tool calls, questions and permission requests show up in the island, and you can answer them there."
-          : "Install the hooks to see your Claude Code sessions in the island and approve permissions without leaving what you are doing.",
+          ? `Coucou is hooked into your ${title} sessions. Tool calls, questions and permission requests show up in the island, and you can answer them there.`
+          : `Install the hooks to see your ${title} sessions in the island and approve permissions without leaving what you are doing.`,
       }),
       h("div", { class: "row" },
-        h("label", { text: "settings.json" }),
+        h("label", { text: file }),
         h("span", { class: "path", text: status.settingsPath }),
       ),
       h("div", { class: "row" },
@@ -117,7 +126,7 @@ function claudeSection(status: HookStatus): HTMLElement {
   async function showPreview(install: boolean) {
     let preview;
     try {
-      preview = await Bridge.hooksPreview(install);
+      preview = await Bridge.hooksPreview(install, agent);
     } catch (err) {
       // An unreadable or invalid settings.json stops here rather than being
       // treated as empty and written over.
@@ -137,8 +146,10 @@ function claudeSection(status: HookStatus): HTMLElement {
       h("div", {
         class: "hint",
         text: install
-          ? "This is exactly what will change in your settings.json. Your own hooks are left untouched."
-          : "This removes Coucou's entries only. Your own hooks are left untouched.",
+          ? `This is exactly what will change in your ${kind}. Your own hooks are left untouched.`
+          : agent === "opencode"
+            ? "This removes the plugin file Coucou wrote, and nothing else."
+            : "This removes Coucou's entries only. Your own hooks are left untouched.",
       }),
       renderDiff(preview.diff),
       h("div", { class: "row" },
@@ -152,11 +163,11 @@ function claudeSection(status: HookStatus): HTMLElement {
     confirm.addEventListener("click", async () => {
       confirm.disabled = true;
       try {
-        const backup = await Bridge.hooksApply(install, preview.fingerprint);
+        const backup = await Bridge.hooksApply(install, preview.fingerprint, agent);
         clear(body);
         body.append(h("div", {
           class: "notice ok",
-          text: `Done. Previous settings saved as ${backup}. Open a new Claude Code session to pick the hooks up.`,
+          text: `Done. Previous ${kind} saved as ${backup}. Open a new ${title} session to pick the hooks up.`,
         }));
         window.setTimeout(() => void rebuild(), 2600);
       } catch (err) {
@@ -389,6 +400,8 @@ function generalSection(): HTMLElement {
     h("option", { value: "primary", text: "Main display" }),
     h("option", { value: "cursor", text: "Display under the cursor" }),
   );
+  // One island per display is a Linux feature for now.
+  if (platform === "linux") screen.append(h("option", { value: "all", text: "Every display" }));
   screen.value = settings.screen;
   screen.addEventListener("change", () => {
     settings.screen = screen.value as Settings["screen"];
@@ -427,6 +440,7 @@ async function main() {
   if (boot) {
     settings = { ...settings, ...boot.settings };
     version = boot.version;
+    platform = boot.platform;
     if (boot.platform === "linux") {
       keyStore = "the Secret Service keyring (GNOME Keyring, KWallet…)";
       hookName = "coucou-hook";
@@ -435,6 +449,12 @@ async function main() {
   const status = (await Bridge.hooksStatus()) ?? {
     installed: false, settingsPath: "", hookPath: "", hookReady: false,
   };
+  // Codex and OpenCode only get a section when they are installed.
+  const others: HTMLElement[] = [];
+  for (const agent of ["codex", "opencode"] as const) {
+    const st = await Bridge.hooksStatus(agent);
+    if (st?.available) others.push(agentSection(agent, st));
+  }
 
   const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
 
@@ -448,7 +468,8 @@ async function main() {
   clear(root);
   root.append(
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
-    claudeSection(status),
+    agentSection("claude", status),
+    ...others,
     apiSection(hasKey),
     integrationsSection(present),
     generalSection(),

@@ -46,6 +46,7 @@ pub fn surface() -> Surface {
 /// shell, so the island goes through XWayland there. `COUCOU_BACKEND=x11`
 /// forces the same anywhere, `COUCOU_BACKEND=wayland` the opposite.
 pub fn pick_backend() {
+    give_bar_back_on_signals();
     // WebKitGTK's DMA-BUF renderer draws transparent windows black or not at
     // all on a good share of drivers; the island is mostly transparent.
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
@@ -320,4 +321,170 @@ fn x11_cursor() -> Option<(f64, f64)> {
             (ok != 0).then_some((rx as f64, ry as f64))
         }
     })
+}
+
+// ── The bar ──────────────────────────────────────────────────────────────────
+
+/// A top bar (Waybar) on the island's monitor, in logical px from the
+/// monitor's top edge. With one, the minimised island is Mochi alone, centred
+/// in the bar, and the bar hides while the island is open.
+#[derive(serde::Serialize, Clone, PartialEq, Debug)]
+pub struct Bar {
+    pub top: f64,
+    pub height: f64,
+}
+
+/// Bars taller than this, or further from the top edge, are not top bars.
+const BAR_MAX_TOP: f64 = 40.0;
+const BAR_MAX_HEIGHT: f64 = 64.0;
+
+/// The top bar on monitor `m`, if there is one.
+///
+/// `COUCOU_BAR=off` turns the bar mode off, `COUCOU_BAR=5,34` sets it by hand
+/// (top, height) for compositors we cannot ask. Otherwise Hyprland is asked
+/// for its layer surfaces and the Waybar one on this monitor is used
+/// (`COUCOU_BAR_NAMESPACE` names another bar).
+pub fn bar_for(m: &Monitor) -> Option<Bar> {
+    let key = (m.position().x, m.position().y);
+    let found = find_bar(m);
+    let mut last = LAST_BARS.lock().unwrap();
+    match found {
+        Some(bar) => {
+            last.insert(key, bar.clone());
+            Some(bar)
+        }
+        // We hid it ourselves: it is still that island's bar.
+        None if BAR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) => last.get(&key).cloned(),
+        None => {
+            last.remove(&key);
+            None
+        }
+    }
+}
+
+/// The last bar seen on each display (by origin), for while it is hidden.
+static LAST_BARS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(i32, i32), Bar>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn find_bar(m: &Monitor) -> Option<Bar> {
+    match std::env::var("COUCOU_BAR").ok().as_deref() {
+        Some("off") | Some("0") => return None,
+        Some(manual) if manual.contains(',') => {
+            let (t, h) = manual.split_once(',')?;
+            return Some(Bar { top: t.trim().parse().ok()?, height: h.trim().parse().ok()? });
+        }
+        _ => {}
+    }
+    let namespace = std::env::var("COUCOU_BAR_NAMESPACE").unwrap_or_else(|_| "waybar".into());
+    let scale = m.scale_factor();
+    let (mx, my) = (m.position().x as f64 / scale, m.position().y as f64 / scale);
+    let (mw, mh) = (m.size().width as f64 / scale, m.size().height as f64 / scale);
+
+    let layers: serde_json::Value = serde_json::from_str(&hyprland_request("j/layers")?).ok()?;
+    let bars = layers
+        .as_object()?
+        .values()
+        .filter_map(|mon| mon.get("levels")?.as_object())
+        .flat_map(|levels| levels.values())
+        .filter_map(|list| list.as_array())
+        .flatten()
+        .filter(|l| l.get("namespace").and_then(|n| n.as_str()) == Some(namespace.as_str()));
+    for l in bars {
+        let num = |k: &str| l.get(k).and_then(|v| v.as_f64());
+        let (Some(x), Some(y), Some(h)) = (num("x"), num("y"), num("h")) else { continue };
+        let inside = x >= mx && x < mx + mw && y >= my && y < my + mh;
+        let top = y - my;
+        if inside && top <= BAR_MAX_TOP && h > 0.0 && h <= BAR_MAX_HEIGHT {
+            return Some(Bar { top, height: h });
+        }
+    }
+    None
+}
+
+/// One request on Hyprland's request socket.
+fn hyprland_request(what: &str) -> Option<String> {
+    let path = hyprland_socket()?;
+    let mut s = UnixStream::connect(path).ok()?;
+    let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+    s.write_all(what.as_bytes()).ok()?;
+    let mut out = String::new();
+    s.read_to_string(&mut out).ok()?;
+    Some(out)
+}
+
+// ── Hiding the bar while the island is open ──────────────────────────────────
+
+/// Islands that are open right now. While any is, Waybar is hidden, so the
+/// open island hangs from the top edge exactly like the original.
+static OPEN_ISLANDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Whether we hid Waybar and owe it a toggle back.
+static BAR_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Island `label` opened (`true`) or closed (`false`).
+pub fn island_open(label: &str, open: bool) {
+    let any_open = {
+        let mut list = OPEN_ISLANDS.lock().unwrap();
+        list.retain(|l| l != label);
+        if open {
+            list.push(label.to_string());
+        }
+        !list.is_empty()
+    };
+    crate::log::line(format!("{label} {} — bar hidden: {any_open}", if open { "open" } else { "closed" }));
+    set_bar_hidden(any_open);
+}
+
+/// Hides or shows Waybar. Its only remote switch is SIGUSR1, a toggle, so we
+/// keep track of what we did and only ever undo our own toggle.
+pub fn set_bar_hidden(hide: bool) {
+    use std::sync::atomic::Ordering;
+    if BAR_HIDDEN.load(Ordering::Relaxed) == hide {
+        return;
+    }
+    if signal_waybar() {
+        BAR_HIDDEN.store(hide, Ordering::Relaxed);
+    }
+}
+
+/// SIGTERM, SIGINT and SIGHUP end the app without Tauri's exit event, which is
+/// where the bar is normally given back. They are blocked here, before any
+/// other thread exists so every thread inherits the mask, and taken by one
+/// thread that restores the bar and then exits.
+fn give_bar_back_on_signals() {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaddset(&mut set, sig);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        let set = set;
+        std::thread::spawn(move || {
+            let mut sig = 0;
+            libc::sigwait(&set, &mut sig);
+            set_bar_hidden(false);
+            std::process::exit(128 + sig);
+        });
+    }
+}
+
+/// SIGUSR1 to every Waybar of ours. False when there is none.
+fn signal_waybar() -> bool {
+    let me = unsafe { libc::getuid() };
+    let mut sent = false;
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+        let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+        if comm.trim() != "waybar" {
+            continue;
+        }
+        use std::os::unix::fs::MetadataExt;
+        if entry.metadata().map(|m| m.uid() != me).unwrap_or(true) {
+            continue;
+        }
+        if unsafe { libc::kill(pid, libc::SIGUSR1) } == 0 {
+            sent = true;
+        }
+    }
+    sent
 }

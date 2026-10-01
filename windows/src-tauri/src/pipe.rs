@@ -24,13 +24,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::mpsc;
 
-use crate::island::WINDOW_LABEL;
 use crate::log;
 
 /// Slightly under coucou-hook's own 110 s wait, so we always answer first.
@@ -197,7 +196,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + HangUp>(app: AppHandle, mut 
 
     if event != "PermissionRequest" {
         log::line(format!("hook {event}"));
-        let _ = app.emit_to(WINDOW_LABEL, "hook", payload);
+        crate::island::emit_islands(&app, "hook", payload);
         pipe.hang_up();
         return;
     }
@@ -210,7 +209,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + HangUp>(app: AppHandle, mut 
     }
     payload["request_id"] = json!(id);
     log::line(format!("hook PermissionRequest id={id}"));
-    let _ = app.emit_to(WINDOW_LABEL, "hook", payload);
+    crate::island::emit_islands(&app, "hook", payload);
 
     let decision = wait_for_decision(&id, &mut rx).await;
     app.state::<Pending>().0.lock().unwrap().remove(&id);

@@ -34,12 +34,93 @@ pub const HOOK_EVENTS: &[(&str, u64)] = &[
     ("SubagentStop", 10),
 ];
 
+/// What Codex is told to forward. Its hooks.json takes the same shape and the
+/// same event names as Claude Code's settings.json.
+pub const CODEX_EVENTS: &[(&str, u64)] = &[
+    ("SessionStart", 10),
+    ("SessionEnd", 10),
+    ("UserPromptSubmit", 10),
+    ("PreToolUse", 10),
+    ("PostToolUse", 10),
+    ("PermissionRequest", 120),
+    ("Stop", 10),
+    ("SubagentStart", 10),
+    ("SubagentStop", 10),
+];
+
 /// Marker that identifies a Coucou entry inside settings.json.
 const MARKER: &str = "coucou-hook";
+
+/// The coding agents Coucou can watch. Claude Code and Codex take command hooks
+/// in a JSON file; OpenCode takes a plugin file that calls the same relay.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Agent {
+    Claude,
+    Codex,
+    OpenCode,
+}
+
+impl Agent {
+    /// `None` keeps the original single-agent commands meaning Claude Code.
+    pub fn parse(name: Option<&str>) -> Result<Agent, String> {
+        match name.unwrap_or("claude") {
+            "claude" => Ok(Agent::Claude),
+            "codex" => Ok(Agent::Codex),
+            "opencode" => Ok(Agent::OpenCode),
+            other => Err(format!("unknown agent {other}")),
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Agent::Claude => "claude",
+            Agent::Codex => "codex",
+            Agent::OpenCode => "opencode",
+        }
+    }
+
+    /// The file Coucou edits for this agent.
+    pub fn path(self) -> PathBuf {
+        match self {
+            Agent::Claude => settings_path(),
+            Agent::Codex => std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join(".codex"))
+                .join("hooks.json"),
+            Agent::OpenCode => {
+                #[cfg(windows)]
+                let config = home().join(".config");
+                #[cfg(not(windows))]
+                let config = match std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+                    Some(p) if p.is_absolute() => p,
+                    _ => home().join(".config"),
+                };
+                config.join("opencode").join("plugin").join("coucou.js")
+            }
+        }
+    }
+
+    /// Whether the agent looks installed: its config directory exists.
+    fn available(self) -> bool {
+        match self {
+            Agent::Claude => true,
+            Agent::Codex => self.path().parent().map(Path::exists).unwrap_or(false),
+            Agent::OpenCode => self
+                .path()
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::exists)
+                .unwrap_or(false),
+        }
+    }
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookStatus {
+    pub agent: String,
+    /// The agent's own config directory exists, so it is worth offering.
+    pub available: bool,
     pub installed: bool,
     pub settings_path: String,
     pub hook_path: String,
@@ -71,14 +152,13 @@ pub fn settings_path() -> PathBuf {
     home().join(".claude").join("settings.json")
 }
 
-/// Reads `~/.claude/settings.json`.
+/// Reads one agent's JSON settings (`~/.claude/settings.json`, `~/.codex/hooks.json`).
 ///
 /// The only error that means "start from nothing" is the file not being there.
 /// Everything else — a lock held by another process, a permission problem, JSON
 /// we cannot parse — is reported, because the alternative is treating somebody's
 /// unreadable settings as an empty object and then writing that back over them.
-fn read_settings() -> Result<Value, String> {
-    let path = settings_path();
+fn read_json(path: &Path) -> Result<Value, String> {
     match std::fs::read(&path) {
         Ok(bytes) => parse_settings(&bytes, &path.display().to_string()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
@@ -110,13 +190,18 @@ fn parse_settings(bytes: &[u8], path: &str) -> Result<Value, String> {
 /// The settings as they are, or an empty object when we cannot tell. Only for
 /// read-only paths like `status()`, which must never fail loudly; anything that
 /// writes uses `read_settings()` and surfaces the error instead.
-fn read_settings_lossy() -> Value {
-    read_settings().unwrap_or_else(|_| json!({}))
+fn read_json_lossy(path: &Path) -> Value {
+    read_json(path).unwrap_or_else(|_| json!({}))
 }
 
-fn hook_command(event: &str) -> String {
+/// Claude Code's command stays exactly what it always was; the others say who
+/// they are, so the island can tell the sessions apart.
+fn hook_command_for(agent: Agent, event: &str) -> String {
     let exe = settings::hook_exe_path().to_string_lossy().replace('\\', "/");
-    format!("\"{exe}\" {event}")
+    match agent {
+        Agent::Claude => format!("\"{exe}\" {event}"),
+        _ => format!("\"{exe}\" --agent {} {event}", agent.id()),
+    }
 }
 
 fn entry_is_ours(entry: &Value) -> bool {
@@ -135,7 +220,13 @@ fn entry_is_ours(entry: &Value) -> bool {
 }
 
 /// Settings with Coucou's hooks added; everything else is left untouched.
+#[cfg(test)]
 fn merged(existing: &Value) -> Value {
+    merged_for(Agent::Claude, existing)
+}
+
+fn merged_for(agent: Agent, existing: &Value) -> Value {
+    let events = if agent == Agent::Codex { CODEX_EVENTS } else { HOOK_EVENTS };
     let mut root = existing.as_object().cloned().unwrap_or_default();
     let mut hooks = root
         .get("hooks")
@@ -143,7 +234,7 @@ fn merged(existing: &Value) -> Value {
         .cloned()
         .unwrap_or_else(Map::new);
 
-    for (event, timeout) in HOOK_EVENTS {
+    for (event, timeout) in events {
         let mut list = hooks
             .get(*event)
             .and_then(Value::as_array)
@@ -153,7 +244,7 @@ fn merged(existing: &Value) -> Value {
         list.push(json!({
             "hooks": [{
                 "type": "command",
-                "command": hook_command(event),
+                "command": hook_command_for(agent, event),
                 "timeout": timeout,
             }]
         }));
@@ -204,9 +295,9 @@ fn stamp() -> String {
     format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
 
-fn backup_path() -> PathBuf {
-    let p = settings_path();
-    p.with_file_name(format!("settings.json.bak-{}", stamp()))
+fn backup_path(path: &Path) -> PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    path.with_file_name(format!("{name}.bak-{}", stamp()))
 }
 
 /// Identifies the exact bytes a preview was computed from. FNV-1a is plenty:
@@ -220,8 +311,8 @@ fn fingerprint(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-fn current_fingerprint() -> String {
-    match std::fs::read(settings_path()) {
+fn current_fingerprint(path: &Path) -> String {
+    match std::fs::read(path) {
         Ok(bytes) => fingerprint(&bytes),
         Err(_) => fingerprint(b""),
     }
@@ -230,35 +321,70 @@ fn current_fingerprint() -> String {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 pub fn status() -> HookStatus {
-    let current = read_settings_lossy();
-    let installed = current
-        .get("hooks")
-        .and_then(Value::as_object)
-        .map(|hooks| {
-            hooks
-                .values()
-                .filter_map(Value::as_array)
-                .flatten()
-                .any(entry_is_ours)
-        })
-        .unwrap_or(false);
+    status_for(Agent::Claude)
+}
+
+pub fn status_for(agent: Agent) -> HookStatus {
+    let path = agent.path();
+    let installed = match agent {
+        Agent::OpenCode => std::fs::read_to_string(&path)
+            .map(|t| t.contains(MARKER))
+            .unwrap_or(false),
+        _ => read_json_lossy(&path)
+            .get("hooks")
+            .and_then(Value::as_object)
+            .map(|hooks| {
+                hooks
+                    .values()
+                    .filter_map(Value::as_array)
+                    .flatten()
+                    .any(entry_is_ours)
+            })
+            .unwrap_or(false),
+    };
     let hook_path = settings::hook_exe_path();
     HookStatus {
+        agent: agent.id().to_string(),
+        available: agent.available(),
         installed,
-        settings_path: settings_path().to_string_lossy().to_string(),
+        settings_path: path.to_string_lossy().to_string(),
         hook_ready: hook_path.exists(),
         hook_path: hook_path.to_string_lossy().to_string(),
     }
 }
 
+/// The file's text as it is and as it would be after the change.
+fn before_after(agent: Agent, install: bool) -> Result<(String, String), String> {
+    let path = agent.path();
+    if agent == Agent::OpenCode {
+        let current = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("Can't read {}: {e}", path.display())),
+        };
+        let next = if install { opencode_plugin() } else { String::new() };
+        return Ok((current, next));
+    }
+    let current = read_json(&path)?;
+    let next = if install { merged_for(agent, &current) } else { without_ours(&current) };
+    let mut text = pretty(&next);
+    text.push('\n');
+    Ok((pretty(&current), text))
+}
+
+#[cfg(test)]
 pub fn preview(install: bool) -> Result<HookPreview, String> {
-    let current = read_settings()?;
-    let next = if install { merged(&current) } else { without_ours(&current) };
+    preview_for(Agent::Claude, install)
+}
+
+pub fn preview_for(agent: Agent, install: bool) -> Result<HookPreview, String> {
+    let path = agent.path();
+    let (before, after) = before_after(agent, install)?;
     Ok(HookPreview {
-        diff: unified_diff(&pretty(&current), &pretty(&next)),
-        backup: backup_path().to_string_lossy().to_string(),
-        settings_path: settings_path().to_string_lossy().to_string(),
-        fingerprint: current_fingerprint(),
+        diff: unified_diff(&before, &after),
+        backup: backup_path(&path).to_string_lossy().to_string(),
+        settings_path: path.to_string_lossy().to_string(),
+        fingerprint: current_fingerprint(&path),
     })
 }
 
@@ -268,40 +394,60 @@ pub fn preview(install: bool) -> Result<HookPreview, String> {
 /// in between — another tool, another window, the user's own editor — we stop
 /// and make them look at a fresh diff, because the only thing worse than not
 /// installing the hooks is silently reverting somebody else's edit.
+#[cfg(test)]
 pub fn write(install: bool, fingerprint: &str) -> Result<String, String> {
-    let path = settings_path();
+    write_for(Agent::Claude, install, fingerprint)
+}
+
+pub fn write_for(agent: Agent, install: bool, fingerprint: &str) -> Result<String, String> {
+    let path = agent.path();
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
 
     // Read before the backup: an unreadable file must abort before we touch
     // anything at all.
-    let current = read_settings()?;
-    if current_fingerprint() != fingerprint {
+    let (_, next) = before_after(agent, install)?;
+    if current_fingerprint(&path) != fingerprint {
         return Err(format!(
             "{} changed since the preview. Nothing was written — review the new diff.",
             path.display()
         ));
     }
 
-    let backup = backup_path();
+    let backup = backup_path(&path);
     if path.exists() {
         std::fs::copy(&path, &backup).map_err(|e| format!("backup failed: {e}"))?;
     }
 
-    let next = if install { merged(&current) } else { without_ours(&current) };
-    let mut text = pretty(&next);
-    text.push('\n');
+    // Uninstalling the OpenCode plugin is deleting the file Coucou wrote.
+    if agent == Agent::OpenCode && !install {
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| format!("remove failed: {e}"))?;
+        }
+        return Ok(backup.to_string_lossy().to_string());
+    }
 
     // Write beside the target and rename over it: a crash or a full disk leaves
     // the original settings.json intact rather than half a file.
-    let temp = path.with_extension(format!("json.coucou-{}", std::process::id()));
-    std::fs::write(&temp, text.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+    let temp = path.with_extension(format!("coucou-{}", std::process::id()));
+    std::fs::write(&temp, next.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
     if let Err(err) = std::fs::rename(&temp, &path) {
         let _ = std::fs::remove_file(&temp);
         return Err(format!("write failed: {err}"));
     }
     Ok(backup.to_string_lossy().to_string())
 }
+
+/// The OpenCode plugin: turns OpenCode's plugin hooks into the same events
+/// Claude Code sends, and hands them to coucou-hook. A permission prompt waits
+/// for the island exactly like Claude Code's does; anything else is fire and
+/// forget, and a missing Coucou costs OpenCode nothing.
+fn opencode_plugin() -> String {
+    let exe = settings::hook_exe_path().to_string_lossy().replace('\\', "/");
+    OPENCODE_PLUGIN.replace("\"@HOOK@\"", &serde_json::to_string(&exe).unwrap_or_default())
+}
+
+const OPENCODE_PLUGIN: &str = include_str!("opencode-plugin.js");
 
 /// Copies coucou-hook.exe into %LOCALAPPDATA%\Coucou\bin on launch (on Linux:
 /// coucou-hook into ~/.local/share/coucou/bin). In a bundled install it comes
@@ -523,6 +669,27 @@ mod tests {
         // And removing ours puts it back exactly as it was.
         let cleaned = without_ours(&after);
         assert_eq!(cleaned, existing);
+    }
+
+    #[test]
+    fn codex_hooks_say_who_they_are_and_keep_the_rest() {
+        let existing = json!({ "hooks": { "Stop": [
+            { "hooks": [{ "type": "command", "command": "notify-send done" }] }
+        ] } });
+        let next = merged_for(Agent::Codex, &existing);
+        let stop = next["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "the user's own Stop hook must survive");
+        assert!(stop[1]["hooks"][0]["command"].as_str().unwrap().contains("--agent codex Stop"));
+        // Codex has no Notification event; nothing is invented for it.
+        assert!(next["hooks"].get("Notification").is_none());
+        assert_eq!(without_ours(&next), existing);
+    }
+
+    #[test]
+    fn the_opencode_plugin_carries_the_relay_path() {
+        let plugin = opencode_plugin();
+        assert!(!plugin.contains("@HOOK@"));
+        assert!(plugin.contains(MARKER), "status() finds the plugin by the relay name");
     }
 
     #[test]

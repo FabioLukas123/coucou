@@ -14,7 +14,8 @@
 //!   island is the whole point. No answer means empty stdout, and Claude Code
 //!   asks in the terminal exactly as if Coucou were not installed.
 //!
-//! Usage: `coucou-hook <EventName>` (the name is also read from the JSON).
+//! Usage: `coucou-hook [--agent codex|opencode] <EventName>` (the name is also
+//! read from the JSON). Without `--agent` the event is Claude Code's.
 
 use std::io::{Read, Write};
 use std::sync::mpsc;
@@ -168,7 +169,7 @@ fn read_event() -> Option<(String, String)> {
 
     // The event name is passed as argv[1] by the hook command; the JSON usually
     // carries it too. Trust argv when the JSON is missing it.
-    let arg_event = std::env::args().nth(1).unwrap_or_default();
+    let (agent, arg_event) = parse_args(std::env::args().skip(1));
     let event = map
         .get("hook_event_name")
         .and_then(|v| v.as_str())
@@ -176,6 +177,8 @@ fn read_event() -> Option<(String, String)> {
         .filter(|s| !s.is_empty())
         .unwrap_or(arg_event);
     map.insert("hook_event_name".into(), serde_json::Value::String(event.clone()));
+    // Which coding agent sent it; the island keeps one pill per agent.
+    map.insert("agent".into(), serde_json::Value::String(agent));
 
     for field in DROPPED_FIELDS {
         map.remove(*field);
@@ -216,6 +219,23 @@ fn read_event() -> Option<(String, String)> {
     let mut line = payload.to_string();
     line.push('\n');
     Some((line, event))
+}
+
+/// `[--agent NAME] EVENT` → (agent, event). The agent defaults to Claude Code,
+/// which is what every hook command written before `--agent` existed means.
+fn parse_args(mut args: impl Iterator<Item = String>) -> (String, String) {
+    let mut agent = "claude".to_string();
+    let mut event = String::new();
+    while let Some(arg) = args.next() {
+        if arg == "--agent" {
+            if let Some(name) = args.next() {
+                agent = name;
+            }
+        } else if event.is_empty() {
+            event = arg;
+        }
+    }
+    (agent, event)
 }
 
 /// Caps every string in the payload. A single Write can carry a whole file.
@@ -293,6 +313,14 @@ mod tests {
         assert!(decision_json("maybe").is_none());
         // The shape the app used to send must not be mistaken for a decision.
         assert!(decision_json(r#"{"permissionDecision":"allow"}"#).is_none());
+    }
+
+    #[test]
+    fn the_agent_flag_is_optional() {
+        let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
+        assert_eq!(args(&["Stop"]), ("claude".into(), "Stop".into()));
+        assert_eq!(args(&["--agent", "codex", "Stop"]), ("codex".into(), "Stop".into()));
+        assert_eq!(args(&[]), ("claude".into(), String::new()));
     }
 
     #[test]

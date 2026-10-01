@@ -33,7 +33,20 @@ export interface BootInfo {
    * the webview's own mouse events instead of the `cursor` event.
    */
   domCursor: boolean;
+  /** This window's label: `island`, or `island-1`… on the other displays. */
+  label: string;
+  /** Linux: the top bar the minimised island sits in. */
+  bar: Bar | null;
 }
+
+/** A top bar, in logical px from the top of the island's display. */
+export interface Bar {
+  top: number;
+  height: number;
+}
+
+/** The coding agents Coucou can watch. */
+export type AgentName = "claude" | "codex" | "opencode";
 
 export const Bridge = {
   boot: () => call<BootInfo>("boot"),
@@ -53,7 +66,11 @@ export const Bridge = {
   /** Give the window keyboard focus (chat field) and take it away again. */
   focusWindow: (focused: boolean) => call<void>("focus_window", { focused }),
 
-  reposition: () => call<void>("reposition"),
+  /** Places this island again; resolves with the bar it now sits in. */
+  reposition: () => call<Bar | null>("reposition"),
+
+  /** Bar mode: the island opened or closed — Rust hides or shows the bar. */
+  islandOpen: (open: boolean) => call<void>("island_open", { open }),
 
   openUrl: (url: string) => call<void>("open_url", { url }),
 
@@ -68,15 +85,16 @@ export const Bridge = {
   log: (message: string) => call<void>("log_line", { message }),
 
   // ── Claude Code hooks ─────────────────────────────────────────────────────
-  hooksStatus: () => call<HookStatus>("hooks_status"),
+  hooksStatus: (agent: AgentName = "claude") => call<HookStatus>("hooks_status", { agent }),
   /** Diff to show before anything is written. `install: false` previews removal. */
-  hooksPreview: (install: boolean) => callOrThrow<HookPreview>("hooks_preview", { install }),
+  hooksPreview: (install: boolean, agent: AgentName = "claude") =>
+    callOrThrow<HookPreview>("hooks_preview", { install, agent }),
   /**
    * Writes ~/.claude/settings.json — only ever after an explicit click, and only
    * when the file still matches the preview the user looked at.
    */
-  hooksApply: (install: boolean, fingerprint: string) =>
-    callOrThrow<string>("hooks_apply", { install, fingerprint }),
+  hooksApply: (install: boolean, fingerprint: string, agent: AgentName = "claude") =>
+    callOrThrow<string>("hooks_apply", { install, fingerprint, agent }),
 
   approvalDecision: (requestId: string, decision: "allow" | "deny") =>
     call<void>("approval_decision", { requestId, decision }),
@@ -124,6 +142,9 @@ export interface DroppedFile {
 }
 
 export interface HookStatus {
+  agent?: AgentName;
+  /** The agent's config directory exists. */
+  available?: boolean;
   installed: boolean;
   settingsPath: string;
   hookPath: string;

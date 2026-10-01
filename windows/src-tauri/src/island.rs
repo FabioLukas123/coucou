@@ -85,6 +85,16 @@ pub struct PollGate {
     /// where we asked for it.
     #[cfg(target_os = "linux")]
     pub origin: Mutex<(f64, f64)>,
+    /// Linux, one island per display: the display this island belongs to, by
+    /// its physical origin. `None` follows the "screen" preference instead.
+    #[cfg(target_os = "linux")]
+    pub monitor: Mutex<Option<(i32, i32)>>,
+    /// The bar on that display, as last measured.
+    #[cfg(target_os = "linux")]
+    pub bar: Mutex<Option<crate::linux::Bar>>,
+    /// The window is gone; its poll thread should end.
+    #[cfg(target_os = "linux")]
+    pub closed: AtomicBool,
 }
 
 impl PollGate {
@@ -97,6 +107,12 @@ impl PollGate {
             ignoring: AtomicBool::new(false),
             #[cfg(target_os = "linux")]
             origin: Mutex::new((0.0, 0.0)),
+            #[cfg(target_os = "linux")]
+            monitor: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            bar: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -129,6 +145,21 @@ impl PollGate {
 
 pub fn window(app: &AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window(WINDOW_LABEL)
+}
+
+/// `island` on every platform; on Linux also `island-1`, `island-2`… — one per
+/// extra display.
+pub fn is_island(label: &str) -> bool {
+    label == WINDOW_LABEL || label.starts_with("island-")
+}
+
+/// Sends an event to every island window: they all show the same sessions.
+pub fn emit_islands<S: Serialize + Clone>(app: &AppHandle, event: &str, payload: S) {
+    for (label, _) in app.webview_windows() {
+        if is_island(&label) {
+            let _ = app.emit_to(label.as_str(), event, payload.clone());
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -238,6 +269,7 @@ pub fn screen_info(app: &AppHandle, pref: &str) -> ScreenInfo {
 }
 
 /// Places and sizes the window. `collapsed` picks the wake strip instead of the panel.
+#[cfg(windows)]
 pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let Some(win) = window(app) else { return };
     let Some(m) = target_monitor(app, pref) else { return };
@@ -247,19 +279,6 @@ pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let ms = *m.size();
 
     let (lw, lh) = if collapsed { (STRIP_W, STRIP_H) } else { (PANEL_W, PANEL_H) };
-
-    // Layer shell: the compositor anchors the surface, we only size it.
-    #[cfg(target_os = "linux")]
-    if linux::surface() == linux::Surface::Layer {
-        let handle = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            let origin = linux::place_layer(&win, &m, lw, lh);
-            if let Some(shared) = handle.try_state::<crate::Shared>() {
-                *shared.gate.origin.lock().unwrap() = origin;
-            }
-        });
-        return;
-    }
 
     let pw = (lw * scale).round().max(1.0) as u32;
     let ph = (lh * scale).round().max(1.0) as u32;
@@ -294,6 +313,73 @@ pub fn make_non_activating(win: &WebviewWindow) {
     }
 }
 
+/// Linux: places and sizes island `label` on its display. With a top bar the
+/// wake strip covers the bar's centre.
+#[cfg(target_os = "linux")]
+pub fn place(app: &AppHandle, label: &str, gate: &PollGate, pref: &str, collapsed: bool) {
+    let Some(win) = app.get_webview_window(label) else { return };
+    let wanted = *gate.monitor.lock().unwrap();
+    let m = match wanted {
+        Some(pos) => app
+            .available_monitors()
+            .ok()
+            .and_then(|ms| ms.into_iter().find(|m| (m.position().x, m.position().y) == pos)),
+        None => target_monitor(app, pref),
+    };
+    let Some(m) = m else { return };
+
+    let bar = linux::bar_for(&m);
+    let bar_bottom = bar.as_ref().map(|b| b.top + b.height);
+    *gate.bar.lock().unwrap() = bar;
+    let (lw, lh) = if collapsed {
+        (STRIP_W, STRIP_H.max(bar_bottom.unwrap_or(0.0)))
+    } else {
+        // The bar hides while the island is open, which then hangs from the
+        // top edge as it always did: the panel needs no extra room.
+        (PANEL_W, PANEL_H)
+    };
+
+    if linux::surface() == linux::Surface::Layer {
+        // The compositor anchors the surface, we only size it.
+        let origin = linux::place_layer(&win, &m, lw, lh);
+        *gate.origin.lock().unwrap() = origin;
+        return;
+    }
+
+    let scale = m.scale_factor();
+    let mp = *m.position();
+    let ms = *m.size();
+    let pw = (lw * scale).round().max(1.0) as u32;
+    let ph = (lh * scale).round().max(1.0) as u32;
+    let x = mp.x + (ms.width as i32 - pw as i32) / 2;
+    let _ = win.set_size(PhysicalSize::new(pw, ph));
+    let _ = win.set_position(PhysicalPosition::new(x, mp.y));
+    let _ = win.set_size(PhysicalSize::new(pw, ph));
+    let _ = win.set_always_on_top(true);
+}
+
+/// Every display's origin, size and scale, and the bar on it. Any change means
+/// islands may have to be added, removed or placed again.
+#[cfg(target_os = "linux")]
+pub fn layout_key(app: &AppHandle) -> String {
+    let Ok(monitors) = app.available_monitors() else { return String::new() };
+    monitors
+        .iter()
+        .map(|m| {
+            format!(
+                "{},{} {}x{} @{} {:?}",
+                m.position().x,
+                m.position().y,
+                m.size().width,
+                m.size().height,
+                m.scale_factor(),
+                linux::bar_for(m)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// Linux: layer surface or X11 hints, set before the window is first shown.
 #[cfg(target_os = "linux")]
 pub fn make_non_activating(win: &WebviewWindow) {
@@ -323,6 +409,7 @@ pub fn set_activating(win: &WebviewWindow, activating: bool) {
 
 /// Position, size and scale of the monitor the island lives on. Any change here
 /// means the island has to be placed again.
+#[cfg(windows)]
 fn current_screen_key(app: &AppHandle) -> Option<(i32, i32, u32, u32, u64)> {
     let pref = app
         .try_state::<crate::Shared>()
@@ -427,35 +514,43 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
 }
 
 /// Linux: same poll, minus click-through — the input region does that job (see
-/// `apply_input_region`). With no global cursor to read (most Wayland
-/// compositors) it only watches the display layout, and the webview's own
-/// mouse events stand in for `cursor`.
+/// `apply_input_region`). One per island window. With no global cursor to read
+/// (most Wayland compositors) it only watches the display layout, and the
+/// webview's own mouse events stand in for `cursor`.
 #[cfg(target_os = "linux")]
-pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
+pub fn spawn_cursor_poll(app: AppHandle, label: String, gate: Arc<PollGate>) {
     std::thread::spawn(move || {
-        let mut last_screen: Option<(i32, i32, u32, u32, u64)> = None;
+        let mut last_layout = String::new();
         loop {
             gate.wait_until_active();
+            if gate.closed.load(Ordering::Relaxed) {
+                return;
+            }
             let mut last = (f64::MIN, f64::MIN);
             let mut ticks: u32 = 0;
             while gate.is_active() {
                 std::thread::sleep(Duration::from_millis(16));
+                if gate.closed.load(Ordering::Relaxed) {
+                    return;
+                }
 
+                // Displays come and go, and bars restart. About every two
+                // seconds, one Hyprland query and a monitor list.
                 ticks = ticks.wrapping_add(1);
-                if ticks % 30 == 0 {
-                    let now = current_screen_key(&app);
-                    if now.is_some() && now != last_screen {
-                        let first = last_screen.is_none();
-                        last_screen = now;
+                if ticks % 120 == 1 {
+                    let now = layout_key(&app);
+                    if !now.is_empty() && now != last_layout {
+                        let first = last_layout.is_empty();
+                        last_layout = now;
                         if !first {
-                            crate::log::line("display layout changed — repositioning".to_string());
-                            let _ = app.emit_to(WINDOW_LABEL, "screen-changed", ());
+                            crate::log::line("display layout changed — placing the islands again".to_string());
+                            crate::islands::request_sync(&app);
                         }
                     }
                 }
 
                 let Some(c) = linux::cursor() else { continue };
-                let Some(win) = window(&app) else { continue };
+                let Some(win) = app.get_webview_window(&label) else { continue };
                 let (x, y) = if c.logical {
                     let o = *gate.origin.lock().unwrap();
                     (c.x - o.0, c.y - o.1)
@@ -468,7 +563,7 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                     continue;
                 }
                 last = (x, y);
-                let _ = win.emit("cursor", CursorPayload { x, y });
+                let _ = win.emit_to(label.as_str(), "cursor", CursorPayload { x, y });
             }
         }
     });
@@ -477,8 +572,8 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
 /// Linux click-through: the input region is the island shape plus the hit
 /// margin; the collapsed wake strip takes the mouse everywhere.
 #[cfg(target_os = "linux")]
-pub fn apply_input_region(app: &AppHandle, gate: &PollGate) {
-    let Some(win) = window(app) else { return };
+pub fn apply_input_region(app: &AppHandle, label: &str, gate: &PollGate) {
+    let Some(win) = app.get_webview_window(label) else { return };
     let region = if gate.collapsed.load(Ordering::Relaxed) {
         None
     } else {

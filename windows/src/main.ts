@@ -20,6 +20,9 @@ async function main() {
   if (boot) {
     State.settings = { ...State.settings, ...boot.settings };
     if (boot.domCursor) island.useDomCursor();
+    Sound.silent = boot.label !== "island";
+    State.platform = boot.platform;
+    island.setBar(boot.bar);
   }
   island.applySettings();
   State.loadIntegrationTasks();
@@ -51,7 +54,7 @@ async function main() {
     }
   });
 
-  await onEvent<null>("screen-changed", () => void Bridge.reposition());
+  await onEvent<null>("screen-changed", async () => island.setBar(await Bridge.reposition()));
 
   // The settings window writes preferences; apply them here without a restart.
   await onEvent<Settings>("settings-changed", (s) => {

@@ -14,9 +14,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
-use crate::island::WINDOW_LABEL;
 use crate::log;
 use crate::secrets;
 
@@ -42,7 +41,7 @@ pub struct IntegrationEvent {
 }
 
 fn emit(app: &AppHandle, update: IntegrationUpdate) {
-    let _ = app.emit_to(WINDOW_LABEL, "integration", update);
+    crate::island::emit_islands(app, "integration", update);
 }
 
 fn client() -> reqwest::Client {

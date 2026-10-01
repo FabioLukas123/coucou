@@ -2,15 +2,15 @@
 // Mirrors IslandRootView.swift + IslandWindowController.swift.
 
 import { Tracked, Spring, clamp } from "../core/anim";
-import { Bridge, IS_TAURI, onDragDrop } from "../core/bridge";
+import { Bridge, IS_TAURI, onDragDrop, type Bar } from "../core/bridge";
 import {
-  EXPANDED_CORNER, EXPANDED_W, NOTCH_W, PANEL_H, PANEL_W,
+  EXPANDED_CORNER, EXPANDED_W, NOTCH_H, NOTCH_W, PANEL_H, PANEL_W,
   ROUNDED_CORNER, VIEW_LAYOUTS, botGlowColor, botGlowOpacity, botPosition, chatPromptHeight,
-  islandSize,
+  WAKE_STRIP_H, islandSize,
   type IslandMode, type IslandViewName,
 } from "../core/layout";
 import { Sound } from "../core/sound";
-import { State } from "../core/state";
+import { State, isAgentTask } from "../core/state";
 import { BotEngine, hexToRGB } from "../mochi/engine";
 import { Greeting } from "../mochi/greeting";
 import { createMiniBot, pruneMiniBots, syncMiniBotStates, tickMiniBots } from "../mochi/minibots";
@@ -23,6 +23,8 @@ import { IslandStateMachine } from "./fsm";
 const BOT_OVERHANG = 40;
 /** Same margin as the Rust hit test (src-tauri/src/island.rs). */
 const HIT_MARGIN = 14;
+/** Bar mode: the minimised island is just big enough for Mochi. */
+const BAR_PILL_W = 44;
 
 /** The three views the drop sequence owns; leaving them stops the engine. */
 const UPLOAD_VIEWS: ReadonlySet<IslandViewName> = new Set(["upload", "uploading", "choose"]);
@@ -54,6 +56,16 @@ export class Island {
   private width = new Tracked(NOTCH_W);
   private height = new Tracked(0);
   private radius = new Tracked(ROUNDED_CORNER);
+  /** Distance of the island from the top of the window: 0 without a bar. */
+  private top = new Tracked(0);
+  /**
+   * Linux, with a top bar (Waybar): the minimised island is just Mochi,
+   * centred in the bar. Opening it hides the bar and the island hangs from the
+   * top edge exactly like the original.
+   */
+  private bar: Bar | null = null;
+  /** What Rust was last told: is this island open over a hidden bar? */
+  private toldOpen = false;
   private botCx = new Spring(46);
   private botCy = new Spring(16);
   private botSize = new Spring(10);
@@ -127,7 +139,7 @@ export class Island {
           integration_notion: "https://notion.so",
           integration_calcom: "https://app.cal.com/bookings",
         };
-        if (task.id === "integration_claude") void Bridge.openInVSCode(task.sessionCwd ?? null);
+        if (isAgentTask(task.id)) void Bridge.openInVSCode(task.sessionCwd ?? null);
         else if (task.id === "integration_n8n") void Bridge.openN8n();
         else if (urls[task.id]) void Bridge.openUrl(urls[task.id]);
       },
@@ -140,12 +152,7 @@ export class Island {
         if (!req) return;
         Sound.play(d === "deny" ? "blip" : "approve");
         void Bridge.approvalDecision(req.requestId, d);
-        State.pendingApproval = null;
-        State.isPinned = false;
-        this.fsm.pinned = false;
-        State.updateTask("integration_claude", "working");
-        State.setPillBadge("integration_claude", null);
-        this.setView(State.defaultView());
+        this.resolveApproval();
       },
       toggleSound: () => {
         State.settings.soundEnabled = !State.settings.soundEnabled;
@@ -456,20 +463,61 @@ export class Island {
 
   private targetSize(): { w: number; h: number; r: number } {
     const { w, h } = islandSize(State.mode, State.view, State.chatHistory.length);
+    if (this.bar && State.mode !== "expanded") return { w: BAR_PILL_W, h, r: NOTCH_H / 2 };
     const r = State.mode === "expanded" ? EXPANDED_CORNER : ROUNDED_CORNER;
     return { w, h, r };
   }
 
+  private targetTop(): number {
+    const bar = this.bar;
+    if (!bar || State.mode === "expanded") return 0;
+    return bar.top + (bar.height - NOTCH_H) / 2;
+  }
+
+  /** The bar this island's display has, from Rust; null for the plain island. */
+  setBar(bar: Bar | null) {
+    const same = bar?.top === this.bar?.top && bar?.height === this.bar?.height;
+    this.bar = bar;
+    // Hovering the middle of the bar wakes a hidden island.
+    this.wakeStrip.style.height = `${bar ? bar.top + bar.height : WAKE_STRIP_H}px`;
+    this.applySkin();
+    if (same) return;
+    this.top.jump(this.targetTop());
+    this.radius.jump(this.targetSize().r);
+    this.dirty = true;
+    this.ensureRunning();
+  }
+
+  /**
+   * In a bar the minimised island has no background and no mini bots — only
+   * Mochi, sitting on the bar. Open, it is the original black island, and the
+   * bar steps aside for it.
+   */
+  private applySkin() {
+    const inBar = this.bar != null && State.mode !== "expanded";
+    this.islandEl.style.background = inBar ? "transparent" : "";
+    this.miniGrid.style.display = inBar ? "none" : "";
+    const open = this.bar != null && State.mode === "expanded";
+    if (open !== this.toldOpen) {
+      this.toldOpen = open;
+      void Bridge.islandOpen(open);
+    }
+  }
+
   private animateGeometry(shrinking: boolean) {
+    this.applySkin();
     const { w, h, r } = this.targetSize();
+    const top = this.targetTop();
     if (shrinking) {
       this.width.curveTowards(w);
       this.height.curveTowards(h);
       this.radius.curveTowards(r);
+      this.top.curveTowards(top);
     } else {
       this.width.springTo(w);
       this.height.springTo(h);
       this.radius.springTo(r);
+      this.top.springTo(top);
     }
     this.ensureRunning();
   }
@@ -478,9 +526,12 @@ export class Island {
     const w = this.width.value;
     const hh = this.height.value;
     const r = this.radius.value;
+    const top = this.top.value;
     this.islandEl.style.width = `${w}px`;
     this.islandEl.style.height = `${hh}px`;
-    this.islandEl.style.borderRadius = `0 0 ${r}px ${r}px`;
+    this.islandEl.style.top = `${top}px`;
+    this.islandEl.style.borderRadius =
+      this.bar && State.mode !== "expanded" ? `${r}px` : `0 0 ${r}px ${r}px`;
     this.islandEl.style.transform = `translateX(-50%)`;
     // These follow the island as it resizes, so they belong here rather than in
     // the state-driven DOM sync.
@@ -489,9 +540,12 @@ export class Island {
     this.greetingCanvas.style.left = `${(w - EXPANDED_W) / 2}px`;
     this.uploadCanvas.el.style.left = `${(w - EXPANDED_W) / 2}px`;
 
-    const rect = { x: (PANEL_W - w) / 2, y: 0, w, h: hh };
+    const rect = { x: (PANEL_W - w) / 2, y: top, w, h: hh };
     const p = this.pushedRect;
-    if (Math.abs(p.x - rect.x) > 0.5 || Math.abs(p.w - rect.w) > 0.5 || Math.abs(p.h - rect.h) > 0.5) {
+    if (
+      Math.abs(p.x - rect.x) > 0.5 || Math.abs(p.y - rect.y) > 0.5 ||
+      Math.abs(p.w - rect.w) > 0.5 || Math.abs(p.h - rect.h) > 0.5
+    ) {
       this.pushedRect = rect;
       void Bridge.setIslandRect(rect.x, rect.y, rect.w, rect.h);
     }
@@ -501,7 +555,7 @@ export class Island {
   private islandRect(): { x: number; y: number; w: number; h: number } {
     const w = this.width.value;
     const hh = this.height.value;
-    return { x: (PANEL_W - w) / 2, y: 0, w, h: hh };
+    return { x: (PANEL_W - w) / 2, y: this.top.value, w, h: hh };
   }
 
   // ── Window collapse (hidden → tiny wake strip, zero polling) ────────────────
@@ -576,6 +630,19 @@ export class Island {
     if (IS_TAURI) {
       document.documentElement.addEventListener("mouseleave", () => this.onCursor(-1e4, -1e4));
     }
+  }
+
+  /** The card is answered — here, or on another display's island. */
+  resolveApproval() {
+    const req = State.pendingApproval;
+    if (!req) return;
+    const id = req.taskId ?? "integration_claude";
+    State.pendingApproval = null;
+    State.isPinned = false;
+    this.fsm.pinned = false;
+    State.updateTask(id, "working");
+    State.setPillBadge(id, null);
+    this.setView(State.defaultView());
   }
 
   /** Cursor in window-logical coordinates. */
@@ -694,6 +761,7 @@ export class Island {
     this.width.step(dt, nowMs);
     this.height.step(dt, nowMs);
     this.radius.step(dt, nowMs);
+    this.top.step(dt, nowMs);
     this.applyGeometry();
 
     if (this.dirty) {
@@ -737,7 +805,7 @@ export class Island {
     // sweep — so a hidden island went on burning frames in exactly the states it
     // spends most of its life in. Geometry still has to finish retracting.
     const settling =
-      this.width.animating || this.height.animating || this.radius.animating;
+      this.width.animating || this.height.animating || this.radius.animating || this.top.animating;
     const busy = State.mode === "hidden"
       ? settling
       : settling ||
@@ -754,6 +822,8 @@ export class Island {
 
   private updateBotTargets() {
     const p = botPosition(State.mode, State.view, this.height.value, State.uploadProgress);
+    // In a bar the minimised island is only Mochi: centre it.
+    if (this.bar && State.mode !== "expanded") p.cx = BAR_PILL_W / 2;
     this.botCx.target = p.cx;
     this.botCy.target = p.cy;
     this.botSize.target = p.diameter / 0.6;
