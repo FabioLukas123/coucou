@@ -97,9 +97,17 @@ export function followNews(island: Island): boolean {
   return true;
 }
 
+/** The usage pills' pollers: their first run comes before the island listens. */
+const USAGE_IDS = ["integration_codex", "integration_opencode", "usage_claude"];
+/** By then the first run is over: what it found is asked for again, once. */
+const FIRST_POLL_MS = 8_000;
+
 export function registerIntegrationHandlers(island: Island) {
   void onEvent<IntegrationUpdate>("integration", (update) => handle(island, update));
   void refreshConfigured();
+  window.setTimeout(() => {
+    for (const id of USAGE_IDS) if (!State.integrations[id]?.loaded) void Bridge.refreshIntegration(id);
+  }, FIRST_POLL_MS);
 }
 
 /** Asks Rust which keys exist so the idle cards can say so. */

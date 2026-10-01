@@ -511,8 +511,10 @@ function statRow(icon: string, color: string, label: string, value: string): HTM
 /** "in 2h 10m", "in 3d" — how far away a reset is. */
 function resetsIn(at: number): string {
   const s = Math.max(0, at - Date.now() / 1000);
-  if (s < 3600) return `in ${Math.round(s / 60)}m`;
-  if (s < 86400) return `in ${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m`;
+  // Rounded once, in minutes: 4 h 59 min 40 s is 5h 0m, never 4h 60m.
+  const m = Math.round(s / 60);
+  if (m < 60) return `in ${m}m`;
+  if (m < 1440) return `in ${Math.floor(m / 60)}h ${m % 60}m`;
   return `in ${Math.round(s / 86400)}d`;
 }
 

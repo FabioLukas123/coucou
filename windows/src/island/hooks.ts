@@ -222,7 +222,7 @@ function forget(island: Island, session: ClaudeSession) {
   stopWaiting(session);
   State.sessions.splice(at, 1);
   State.changes.delete(session.id);
-  // Its agent's last session: the pill goes back to its usage card, or away.
+  // Its agent's last session: the pill goes back to its usage card.
   const pill = sessionPill(session);
   if (!State.sessions.some((s) => sessionPill(s) === pill)) State.dropAgent(pill);
   if (session.id !== State.frontId) {

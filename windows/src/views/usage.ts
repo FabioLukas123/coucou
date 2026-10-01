@@ -35,8 +35,10 @@ function toMs(v: unknown): number {
 function resetsIn(ms: number): string {
   if (!ms) return "";
   const s = Math.max(0, (ms - Date.now()) / 1000);
-  if (s < 3600) return `${Math.max(1, Math.round(s / 60))}m`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h${String(Math.round((s % 3600) / 60)).padStart(2, "0")}`;
+  // Rounded once, in minutes: 4 h 59 min 40 s is 5h00, never 4h60.
+  const m = Math.round(s / 60);
+  if (m < 60) return `${Math.max(1, m)}m`;
+  if (m < 1440) return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}`;
   return `${Math.round(s / 86400)}d`;
 }
 

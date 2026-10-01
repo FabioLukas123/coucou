@@ -297,8 +297,7 @@ export const CLAUDE_ID = "integration_claude";
 /** AgentTask.integrationAgents — same ids, names and colours as macOS. */
 export const INTEGRATION_AGENTS: AgentTask[] = [
   task("integration_claude", "VS Code", "#F5F6F8", "claudeCode"),
-  // Coding agents other than Claude Code. They only get a pill while they have
-  // a session going — see AppState.ensureAgent.
+  // Coding agents other than Claude Code: always a pill, like Claude Code's.
   task("integration_codex", "Codex", "#10A37F", "codex"),
   task("integration_opencode", "OpenCode", "#FAB283", "opencode"),
   task("integration_resend", "Resend", "#22C55E", "n8n"),
@@ -536,8 +535,10 @@ class AppState {
   /** loadIntegrationTasks() — VS Code always on, the rest opt-in (max 4). */
   loadIntegrationTasks() {
     for (const proto of INTEGRATION_AGENTS) {
+      // Claude Code, Codex and OpenCode always have their pill: a session
+      // when one is going, their usage otherwise.
       const shouldLoad =
-        proto.id === "integration_claude" ||
+        isSessionPill(proto.id) ||
         this.liveAgents.has(proto.id) ||
         this.settings.activeIntegrations.includes(proto.id);
       const idx = this.tasks.findIndex((t) => t.id === proto.id);
@@ -571,10 +572,9 @@ class AppState {
     this.loadIntegrationTasks();
   }
 
-  /** Session over: the agent's pill goes away again. */
+  /** Session over: the agent is no longer live; its pill stays, on its usage. */
   dropAgent(id: string) {
     if (!this.liveAgents.delete(id)) return;
-    if (this.focusId === id) this.focusId = "integration_claude";
     this.loadIntegrationTasks();
   }
 
