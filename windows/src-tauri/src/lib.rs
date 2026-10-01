@@ -299,6 +299,24 @@ fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Clicking an agent session: on Linux bring its terminal forward (or open a
+/// terminal in its folder); on Windows, as before, VS Code.
+#[tauri::command]
+fn open_session(path: Option<String>, pids: Option<Vec<u32>>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if linux::focus_session_window(&pids.unwrap_or_default()) {
+            return true;
+        }
+        linux::open_terminal(path.as_deref())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pids;
+        open_in_vscode(path)
+    }
+}
+
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     app.exit(0);
@@ -562,6 +580,7 @@ pub fn run() {
             reposition,
             open_url,
             open_in_vscode,
+            open_session,
             quit_app,
             island_open,
             hooks_status,

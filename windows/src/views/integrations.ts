@@ -69,8 +69,8 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
       h("button", {
         class: "link-btn",
         style: `color:${task.color}b3`,
-        text: "Open Visual Studio Code",
-        onclick: () => void Bridge.openInVSCode(task.sessionCwd ?? null),
+        text: State.platform === "linux" ? "Open terminal" : "Open Visual Studio Code",
+        onclick: () => void Bridge.openSession(task.sessionCwd ?? null, task.sessionPids ?? null),
       }),
     );
   } else if (task.id === "integration_n8n") {

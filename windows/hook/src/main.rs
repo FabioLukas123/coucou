@@ -219,6 +219,13 @@ fn read_event() -> Option<(String, String)> {
         }
     }
 
+    // Linux: the processes above us (agent, shell, terminal…), so the island
+    // can bring the right terminal window forward.
+    #[cfg(target_os = "linux")]
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("ancestor_pids".into(), serde_json::json!(ancestor_pids()));
+    }
+
     truncate_strings(&mut payload);
 
     let mut line = payload.to_string();
@@ -241,6 +248,22 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> (String, String) {
         }
     }
     (agent, event)
+}
+
+/// Our parent, its parent, and so on up to init (at most 16).
+#[cfg(target_os = "linux")]
+fn ancestor_pids() -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut pid = std::os::unix::process::parent_id();
+    while pid > 1 && out.len() < 16 {
+        out.push(pid);
+        // /proc/<pid>/stat: "pid (comm) state ppid …"; comm may hold spaces.
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { break };
+        let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else { break };
+        let Some(ppid) = rest.split_whitespace().nth(1).and_then(|p| p.parse().ok()) else { break };
+        pid = ppid;
+    }
+    out
 }
 
 /// Caps every string in the payload. A single Write can carry a whole file.
@@ -326,6 +349,14 @@ mod tests {
         assert_eq!(args(&["Stop"]), ("claude".into(), "Stop".into()));
         assert_eq!(args(&["--agent", "codex", "Stop"]), ("codex".into(), "Stop".into()));
         assert_eq!(args(&[]), ("claude".into(), String::new()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_process_chain_starts_at_our_parent() {
+        let chain = ancestor_pids();
+        assert_eq!(chain.first().copied(), Some(std::os::unix::process::parent_id()));
+        assert!(!chain.contains(&1), "init is where the walk stops");
     }
 
     #[test]

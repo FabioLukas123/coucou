@@ -30,6 +30,8 @@ interface HookPayload {
   prompt?: string;
   tool_name?: string;
   tool_input?: Record<string, unknown>;
+  /** Linux: the hook's parent processes, nearest first. */
+  ancestor_pids?: number[];
 }
 
 const PROJECT_ALIASES: Record<string, string> = {
@@ -108,11 +110,12 @@ function approvalTarget(tool: string, input: Record<string, unknown>): string {
   return tool;
 }
 
-function upsert(id: string, projectName: string, cwd: string) {
+function upsert(id: string, projectName: string, cwd: string, pids?: number[]) {
   const t = State.tasks.find((x) => x.id === id);
   if (!t) return;
   t.name = projectName;
   if (cwd) t.sessionCwd = cwd;
+  if (pids?.length) t.sessionPids = pids;
 }
 
 function clearSession(id: string) {
@@ -199,13 +202,13 @@ function handleHook(island: Island, payload: HookPayload) {
 
   switch (name) {
     case "SessionStart":
-      upsert(id, projectName, cwd);
+      upsert(id, projectName, cwd, payload.ancestor_pids);
       surface("overview", false);
       Sound.play("work");
       break;
 
     case "UserPromptSubmit": {
-      upsert(id, projectName, cwd);
+      upsert(id, projectName, cwd, payload.ancestor_pids);
       State.updateTask(id, "thinking");
       // The field is `prompt`; reading `message` meant this step was always blank.
       const asked = payload.prompt ?? payload.message;
@@ -215,7 +218,7 @@ function handleHook(island: Island, payload: HookPayload) {
     }
 
     case "PreToolUse": {
-      upsert(id, projectName, cwd);
+      upsert(id, projectName, cwd, payload.ancestor_pids);
       State.updateTask(id, "working");
       const tool = payload.tool_name ?? "Tool";
       State.appendStep(id, stepLabel(tool, payload.tool_input ?? {}));
@@ -286,7 +289,7 @@ function handleHook(island: Island, payload: HookPayload) {
         if (requestId) void Bridge.approvalDecline(requestId);
         break;
       }
-      upsert(id, projectName, cwd);
+      upsert(id, projectName, cwd, payload.ancestor_pids);
       if (pendingTimeout != null) window.clearTimeout(pendingTimeout);
       const tool = payload.tool_name ?? "Tool";
       const input = payload.tool_input ?? {};

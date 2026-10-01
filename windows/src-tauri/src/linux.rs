@@ -638,3 +638,67 @@ fn signal_waybar() -> bool {
     }
     sent
 }
+
+// ── Bringing an agent's terminal forward ─────────────────────────────────────
+
+/// Focuses the terminal window an agent session runs in. `pids` is the
+/// session's process chain, nearest first (the hook sends it); the first one
+/// that owns a window is the terminal. Hyprland only — elsewhere, and when no
+/// window matches (an agent inside an editor or a web UI), false.
+pub fn focus_session_window(pids: &[u32]) -> bool {
+    let Some(clients) = hyprland_request("j/clients") else { return false };
+    let Ok(clients) = serde_json::from_str::<serde_json::Value>(&clients) else { return false };
+    let owners: Vec<u64> = clients
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("pid").and_then(|p| p.as_u64()))
+        .collect();
+    let Some(pid) = pids.iter().map(|p| *p as u64).find(|p| owners.contains(p)) else { return false };
+    // Lua configs take a Lua dispatcher; classic configs the old syntax.
+    let lua = hyprland_request(&format!("dispatch hl.dsp.focus({{ window = \"pid:{pid}\" }})"));
+    if lua.as_deref().map(str::trim) == Some("ok") {
+        return true;
+    }
+    hyprland_request(&format!("dispatch focuswindow pid:{pid}")).as_deref().map(str::trim) == Some("ok")
+}
+
+/// Opens a terminal in `cwd`: $TERMINAL, or the first common one installed.
+pub fn open_terminal(cwd: Option<&str>) -> bool {
+    let dir = cwd
+        .filter(|d| std::path::Path::new(d).is_dir())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(t) = std::env::var("TERMINAL") {
+        candidates.push(t);
+    }
+    for t in ["kitty", "alacritty", "foot", "wezterm", "ghostty", "konsole", "gnome-terminal", "xterm"] {
+        candidates.push(t.to_string());
+    }
+    candidates.into_iter().any(|t| {
+        std::process::Command::new(&t)
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    })
+}
+
+#[cfg(test)]
+mod focus_tests {
+    /// Needs a live Hyprland and COUCOU_TEST_PIDS="child,parent,…" — run by hand.
+    #[test]
+    #[ignore]
+    fn focuses_the_window_owning_a_session_process() {
+        let pids: Vec<u32> = std::env::var("COUCOU_TEST_PIDS")
+            .unwrap()
+            .split(',')
+            .map(|p| p.parse().unwrap())
+            .collect();
+        assert!(super::focus_session_window(&pids));
+    }
+}

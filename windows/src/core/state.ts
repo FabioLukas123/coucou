@@ -19,6 +19,8 @@ export interface AgentTask {
   miniEye?: EyeShape | null;
   pillBadge?: PillBadge | null;
   sessionCwd?: string | null;
+  /** Linux: the session's process chain, so its terminal can be brought forward. */
+  sessionPids?: number[];
 }
 
 export interface ApprovalInfo {
