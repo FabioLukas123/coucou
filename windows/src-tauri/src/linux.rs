@@ -442,6 +442,13 @@ static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
 /// Starts following the bar's visibility. Call once, at setup.
 pub fn init_bar_control(app: &tauri::AppHandle) {
     let _ = APP.set(app.clone());
+    // A Coucou that died with the bar hidden (SIGKILL, a crash) could not give
+    // it back; it left its mark, and this one does it instead.
+    let mark = bar_mark();
+    if mark.exists() {
+        crate::log::line("the bar was left hidden by a previous Coucou — giving it back");
+        apply_bar(false);
+    }
     if let Some(state) = helper_state_file() {
         if let Some(dir) = state.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -531,7 +538,19 @@ fn bar_worker() -> &'static std::sync::mpsc::Sender<bool> {
     })
 }
 
+/// Present while Coucou has the bar hidden: in the runtime directory, so a
+/// new login starts clean.
+fn bar_mark() -> std::path::PathBuf {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    runtime.join("coucou-bar-hidden")
+}
+
 fn apply_bar(hide: bool) {
+    if hide {
+        let _ = std::fs::write(bar_mark(), b"");
+    } else {
+        let _ = std::fs::remove_file(bar_mark());
+    }
     match helper() {
         Some(h) => {
             let _ = std::process::Command::new(h)
