@@ -329,7 +329,8 @@ async fn poll_github(app: AppHandle) {
 // ── Vercel ────────────────────────────────────────────────────────────────────
 
 async fn poll_vercel(app: AppHandle) {
-    let Some(token) = secrets::get("vercel-token") else { return };
+    // Blocking: it may run the Vercel CLI to renew its login.
+    let Some(token) = tokio::task::spawn_blocking(secrets::vercel_token).await.ok().flatten() else { return };
     let response = client()
         .get("https://api.vercel.com/v6/deployments?limit=5")
         .header("Authorization", format!("Bearer {token}"))

@@ -297,7 +297,7 @@ const INTEGRATIONS: IntegrationDef[] = [
   { id: "integration_github", name: "GitHub", color: "#F4505E",
     fields: [{ key: "github-token", label: "Token", placeholder: "ghp_… (or your gh CLI login)", secret: true }] },
   { id: "integration_vercel", name: "Vercel", color: "#7C5CFF",
-    fields: [{ key: "vercel-token", label: "Token", placeholder: "…", secret: true }] },
+    fields: [{ key: "vercel-token", label: "Token", placeholder: "… (or your Vercel CLI login)", secret: true }] },
   { id: "integration_n8n", name: "n8n", color: "#F29B38",
     fields: [
       { key: "n8n-url", label: "Instance URL", placeholder: "https://n8n.example.com", secret: false },
